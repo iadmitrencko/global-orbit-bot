@@ -1,10 +1,26 @@
 function randomMove(centerX, centerY, distance) {
-    const angle = Math.random() * Math.PI * 2;
+    const current = getMapCoords();
 
-    const x = centerX + Math.cos(angle) * distance;
-    const y = centerY + Math.sin(angle) * distance;
+    for (let attempt = 0; attempt < 20; attempt++) {
+        const angle = Math.random() * Math.PI * 2;
 
-    move(x, y);
+        const mapXChange = Math.cos(angle) * distance / 100;
+        const mapYChange = Math.sin(angle) * distance / 100;
+
+        const newX = current.x + mapXChange;
+        const newY = current.y + mapYChange;
+
+        if (newX >= 1 && newX <= 206 && newY >= 1 && newY <= 120) {
+            const x = centerX + Math.cos(angle) * distance;
+            const y = centerY + Math.sin(angle) * distance;
+
+            move(x, y);
+
+            return true;
+        }
+    }
+
+    return false;
 }
 
 function move(x, y) {
@@ -61,10 +77,6 @@ function getMapCoords() {
     };
 }
 
-function isInsideMap(x, y) {
-    return x >= 1 && x <= 200 && y >= 1 && y <= 120;
-}
-
 async function waitUntilStop() {
     let previousCoords = coords.innerText;
     let sameCount = 0;
@@ -88,11 +100,6 @@ const game = document.querySelector('#game-preload');
 const coords = game.contentDocument.querySelector('#coordsText');
 const canvas = game.contentDocument.querySelector('#game-container canvas');
 const rect = canvas.getBoundingClientRect();
-
-const current = getMapCoords();
-
-console.log(current);
-console.log(isInsideMap(current.x, current.y));
 
 for (let i = 0; i < 10; i++) {
     const centerX = rect.width / 2;
