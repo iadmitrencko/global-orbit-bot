@@ -43,11 +43,16 @@
         slowHoldMs: 6000,           // скільки стояти на місці після прильоту до такої коробки
         blacklistTime: 25000,       // скільки ігнорувати коробку після невдачі, мс
 
-        roamMinPx: 120,             // випадковий політ, коли коробок немає
-        roamMaxPx: 320,
+        // політ: курсор тримається натиснутим біля краю екрана, корабель за ним
+        steerRadius: 0.40,          // частка меншої сторони екрана — де тримати курсор
+        steerTick: [70, 170],       // як часто підправляти курс під час польоту, мс
+        steerTurn: 0.14,            // максимальний доворот за один тік, рад
+        roamMaxMs: [12000, 28000],  // скільки летіти в один бік, поки нічого не видно
+        approachMaxMs: 40000,       // максимум на підліт до вже поміченої коробки
 
         // «людськість»
         pause: [260, 900],          // пауза між діями
+        reactPause: [180, 450],     // реакція, коли коробка щойно потрапила в поле зору
         longPauseChance: 0.07,      // іноді довша пауза — ніби відволікся
         longPause: [2500, 8000],
         mouseSteps: [8, 18],        // кроків у русі миші до цілі
@@ -65,7 +70,13 @@
     const rnd = (a, b) => a + Math.random() * (b - a);
     const rndOf = range => rnd(range[0], range[1]);
     const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
-    const log = (...args) => console.log('%c[goBot]', 'color:#66d9ef;font-weight:bold', ...args);
+    const pad = n => String(n).padStart(2, '0');
+    const stamp = () => {
+        const d = new Date();
+
+        return pad(d.getHours()) + ':' + pad(d.getMinutes()) + ':' + pad(d.getSeconds());
+    };
+    const log = (...args) => console.log('%c[goBot ' + stamp() + ']', 'color:#66d9ef;font-weight:bold', ...args);
     const grid = (x, y) => Math.round(x / 100) + '/' + Math.round(y / 100);
 
     // ------------------------------------------------------------ вхід у гру
@@ -293,14 +304,6 @@
         return worldToClient(map, box.x, box.y);
     }
 
-    // скільки екранних px в одній світовій одиниці (масштаб камери — 0.9)
-    function pxPerWorld(map) {
-        const a = worldToClient(map, 0, 0);
-        const b = worldToClient(map, 1000, 0);
-
-        return Math.abs(b.x - a.x) / 1000 || 0.9;
-    }
-
     function inRect(p, rect, margin) {
         return p.x >= rect.left + margin && p.x <= rect.right - margin
             && p.y >= rect.top + margin && p.y <= rect.bottom - margin;
@@ -342,14 +345,6 @@
         k = clamp(k, 0, 1);
 
         return k <= 0.02 ? null : { x: from.x + dx * k, y: from.y + dy * k };
-    }
-
-    function inMapBounds(map, x, y) {
-        const pad = CONFIG.mapPadding;
-
-        return x > pad && y > pad
-            && x < (map.mapWidth || 21000) - pad
-            && y < (map.mapHeight || 13100) - pad;
     }
 
     // ------------------------------------------------- емуляція миші
@@ -398,13 +393,15 @@
     }
 
     // рух по дузі з прискоренням і дрібним тремтінням — не по ідеальній прямій
-    async function moveMouse(x, y) {
+    async function moveMouse(x, y, buttons, minSteps) {
+        buttons = buttons || 0;
+
         if (!cursor.ready) {
             cursor.x = x;
             cursor.y = y;
             cursor.ready = true;
-            fire('pointermove', x, y, 0);
-            fire('mousemove', x, y, 0);
+            fire('pointermove', x, y, buttons);
+            fire('mousemove', x, y, buttons);
 
             return;
         }
@@ -414,7 +411,8 @@
         const dx = x - x0;
         const dy = y - y0;
         const dist = Math.hypot(dx, dy) || 1;
-        const steps = Math.round(clamp(dist / 40, CONFIG.mouseSteps[0], CONFIG.mouseSteps[1]));
+        const floor = minSteps === undefined ? CONFIG.mouseSteps[0] : minSteps;
+        const steps = Math.round(clamp(dist / 40, floor, CONFIG.mouseSteps[1]));
         const bend = rnd(-1, 1) * Math.min(90, dist * 0.35);
         const cx = x0 + dx / 2 - (dy / dist) * bend;
         const cy = y0 + dy / 2 + (dx / dist) * bend;
@@ -425,8 +423,8 @@
             const px = m * m * x0 + 2 * m * t * cx + t * t * x + rnd(-0.8, 0.8);
             const py = m * m * y0 + 2 * m * t * cy + t * t * y + rnd(-0.8, 0.8);
 
-            fire('pointermove', px, py, 0);
-            fire('mousemove', px, py, 0);
+            fire('pointermove', px, py, buttons);
+            fire('mousemove', px, py, buttons);
             await sleep(rndOf(CONFIG.mouseStepDelay));
         }
 
@@ -604,37 +602,108 @@
 
     // ------------------------------------------------- дії
 
-    async function waitStop(map, timeout) {
-        const deadline = Date.now() + timeout;
+    // Політ із затиснутою кнопкою — так літають гравці.
+    // Гра щокадру робить displayLayer.toLocal(курсор), а камера їде за кораблем,
+    // тому курсор біля краю екрана — це ціль, яка постійно тікає вперед: корабель
+    // летить безперервно на повній швидкості. Одиночні кліки натомість дають
+    // «долетів — став — полетів» ривками.
+    async function drag(map, aim, done, maxMs) {
+        let point = aim();
 
-        let lastPos = '';
-        let movedAt = Date.now();
+        if (!point || (done && done())) {
+            return !!point;
+        }
 
-        while (running && Date.now() < deadline) {
-            await sleep(180);
+        point = freeSpot(map, point);
 
-            const hero = map.hero;
+        await moveMouse(point.x, point.y);
+        fire('pointerdown', point.x, point.y, 1);
+        fire('mousedown', point.x, point.y, 1);
 
-            if (!hero) {
-                return;
+        const started = Date.now();
+
+        let reached = false;
+
+        try {
+            while (running && Date.now() - started < maxMs) {
+                await sleep(rndOf(CONFIG.steerTick));
+
+                if (done && done()) {
+                    reached = true;
+                    break;
+                }
+
+                point = aim();
+
+                if (!point) {
+                    break;
+                }
+
+                await moveMouse(point.x, point.y, 1, 1);
             }
+        } finally {
+            fire('pointermove', cursor.x, cursor.y, 1);
+            fire('pointerup', cursor.x, cursor.y, 0);
+            fire('mouseup', cursor.x, cursor.y, 0);
+            fire('click', cursor.x, cursor.y, 0);
+        }
 
-            // з'явилась коробка, до якої вже можна клікнути — не чекаємо кінця польоту
-            const target = pickTarget(map);
+        return reached;
+    }
 
-            if (target && target.clickable) {
-                return;
-            }
+    // Перший натиск мусить влучити в порожнечу: клік по кораблю гра обробить як
+    // вибір цілі, по коробці — як збір, і польоту не буде. Під час самого
+    // перетягування це вже неважливо — реагує тільки pointerdown.
+    function freeSpot(map, point) {
+        const rect = canvas.getBoundingClientRect();
 
-            const pos = Math.round(hero.x) + ':' + Math.round(hero.y);
+        if (isFreeSpace(map, point, 55)) {
+            return point;
+        }
+        if (!map.hero) {
+            return point;
+        }
 
-            if (pos !== lastPos) {
-                lastPos = pos;
-                movedAt = Date.now();
-            } else if (Date.now() - movedAt > 700) {
-                return;
+        const from = worldToClient(map, map.hero.x, map.hero.y);
+        const base = Math.atan2(point.y - from.y, point.x - from.x);
+        const far = Math.hypot(point.x - from.x, point.y - from.y);
+
+        for (let i = 1; i <= 8; i++) {
+            const angle = base + (i % 2 ? 1 : -1) * 0.22 * Math.ceil(i / 2);
+            const candidate = { x: from.x + Math.cos(angle) * far, y: from.y + Math.sin(angle) * far };
+
+            if (isClickable(candidate, rect) && isFreeSpace(map, candidate, 55)) {
+                return candidate;
             }
         }
+
+        return point;
+    }
+
+    // точка, за яку «тягнемо» корабель: на краю екрана в заданому напрямку
+    function steerPoint(map, angle) {
+        if (!map.hero) {
+            return null;
+        }
+
+        const rect = canvas.getBoundingClientRect();
+        const from = worldToClient(map, map.hero.x, map.hero.y);
+        const far = Math.min(rect.width, rect.height) * CONFIG.steerRadius;
+        const raw = { x: from.x + Math.cos(angle) * far, y: from.y + Math.sin(angle) * far };
+
+        return clampToRect(from, raw, rect, CONFIG.edgeMargin) || {
+            x: clamp(raw.x, rect.left + CONFIG.edgeMargin, rect.right - CONFIG.edgeMargin),
+            y: clamp(raw.y, rect.top + CONFIG.edgeMargin, rect.bottom - CONFIG.edgeMargin)
+        };
+    }
+
+    function lerpAngle(a, b, t) {
+        let d = b - a;
+
+        while (d > Math.PI) d -= Math.PI * 2;
+        while (d < -Math.PI) d += Math.PI * 2;
+
+        return a + d * t;
     }
 
     async function waitCollected(map, target) {
@@ -715,6 +784,12 @@
 
             const c = boxToClient(map, target.box);
 
+            // поки наводили мишу, корабель летів далі за попереднім курсом і коробка
+            // могла піти за край екрана — тоді клік влучив би у фон, а не в неї
+            if (!isClickable(c)) {
+                return null;
+            }
+
             return { x: c.x + jx, y: c.y + jy };
         };
 
@@ -739,81 +814,60 @@
         return false;
     }
 
-    // коробка поза екраном або під самим краєм — спершу підлітаємо звичайним кліком
+    // коробка ще поза екраном — ведемо корабель до неї, не відпускаючи кнопку
     async function approach(map, target) {
-        const rect = canvas.getBoundingClientRect();
-        const from = worldToClient(map, map.hero.x, map.hero.y);
-        const edge = clampToRect(from, target.client, rect, CONFIG.edgeMargin);
+        const gone = () => target.box.destroyed || !map.boxes.has(target.hash);
 
-        if (!edge) {
-            return false;
-        }
-
-        let point = null;
-
-        for (let i = 0; i < 6; i++) {
-            const k = rnd(0.78, 0.97);
-            const candidate = { x: from.x + (edge.x - from.x) * k, y: from.y + (edge.y - from.y) * k };
-
-            if (!isClickable(candidate, rect)) {
-                continue;
-            }
-            if (i < 4 && !isFreeSpace(map, candidate, 60)) {
-                continue;
+        return drag(map, () => {
+            if (!map.hero || gone()) {
+                return null;
             }
 
-            point = candidate;
-            break;
-        }
+            const rect = canvas.getBoundingClientRect();
+            const from = worldToClient(map, map.hero.x, map.hero.y);
 
-        if (!point) {
-            return false;
-        }
-
-        await click(point.x, point.y);
-        await waitStop(map, 9000);
-
-        return true;
+            return clampToRect(from, boxToClient(map, target.box), rect, CONFIG.edgeMargin);
+        }, () => gone() || isClickable(boxToClient(map, target.box)), CONFIG.approachMaxMs);
     }
 
     let roamAngle = Math.random() * Math.PI * 2;
 
-    async function roam(map) {
+    // плавний доворот курсу + відхід від краю карти
+    function turnRoamAngle(map) {
         const hero = map.hero;
-        const rect = canvas.getBoundingClientRect();
-        const scale = pxPerWorld(map);
+        const w = map.mapWidth || 21000;
+        const h = map.mapHeight || 13100;
+        const pad = CONFIG.mapPadding;
 
-        for (let i = 0; i < 24; i++) {
-            // тримаємось попереднього напрямку — виглядає як обліт карти, а не смикання
-            const angle = roamAngle + rnd(-0.6, 0.6);
-            const world = rnd(CONFIG.roamMinPx, CONFIG.roamMaxPx) / scale;
-            const wx = hero.x + Math.cos(angle) * world;
-            const wy = hero.y + Math.sin(angle) * world;
+        roamAngle += rnd(-CONFIG.steerTurn, CONFIG.steerTurn);
 
-            if (!inMapBounds(map, wx, wy)) {
-                continue;
-            }
+        const edge = Math.max(
+            (pad - hero.x) / pad,
+            (hero.x - (w - pad)) / pad,
+            (pad - hero.y) / pad,
+            (hero.y - (h - pad)) / pad
+        );
 
-            const point = worldToClient(map, wx, wy);
-
-            if (!isClickable(point, rect)) {
-                continue;
-            }
-            // перші спроби шукаємо чисте місце, далі беремо будь-яке прохідне
-            if (i < 16 && !isFreeSpace(map, point, 60)) {
-                continue;
-            }
-
-            roamAngle = angle;
-            await click(point.x, point.y);
-            await waitStop(map, 9000);
-
-            return true;
+        // що ближче до краю карти, то сильніше доводимо курс до центру
+        if (edge > 0) {
+            roamAngle = lerpAngle(roamAngle, Math.atan2(h / 2 - hero.y, w / 2 - hero.x), clamp(edge, 0, 1) * 0.4);
         }
+    }
 
-        roamAngle = Math.random() * Math.PI * 2;
+    async function roam(map) {
+        return drag(map, () => {
+            if (!map.hero) {
+                return null;
+            }
 
-        return false;
+            turnRoamAngle(map);
+
+            return steerPoint(map, roamAngle);
+        }, () => {
+            const target = pickTarget(map);
+
+            return !!(target && target.clickable);
+        }, rndOf(CONFIG.roamMaxMs));
     }
 
     async function humanPause() {
@@ -858,16 +912,21 @@
                 const target = pickTarget(map);
 
                 if (!target) {
-                    await roam(map);
+                    // політ перервався тим, що в полі зору з'явилась коробка —
+                    // тоді тільки коротка реакція, інакше пролетимо повз неї
+                    await (await roam(map) ? sleep(rndOf(CONFIG.reactPause)) : humanPause());
                 } else if (target.clickable) {
                     await collectBox(map, target);
-                } else if (!await approach(map, target)) {
-                    blacklist.set(target.hash, Date.now() + 8000);
-                }
+                    await humanPause();
+                } else {
+                    if (!await approach(map, target)) {
+                        blacklist.set(target.hash, Date.now() + 8000);
+                    }
 
-                await humanPause();
+                    await sleep(rndOf(CONFIG.reactPause));
+                }
             } catch (e) {
-                console.error('[goBot]', e);
+                console.error('[goBot ' + stamp() + ']', e);
                 await sleep(1500);
             }
         }
@@ -892,6 +951,7 @@
             return list;
         }
 
+        log('видно коробок:', list.length);
         console.table(list.map(b => ({
             тип: b.type,
             координати: b.pos,
