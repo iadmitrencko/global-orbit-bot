@@ -38,7 +38,9 @@
         checkOverlap: true,         // не клікати крізь відкриті вікна інтерфейсу
         stopWhenCargoFull: true,
 
-        collectTimeout: 30000,      // максимум часу на одну коробку, мс
+        collectTimeout: 30000,      // максимум часу на політ до коробки, мс
+        slowTypes: ['PIRATE_BOOTY'], // типи, які збираються довго (зелені/сині/червоні скрині)
+        slowHoldMs: 6000,           // скільки стояти на місці після прильоту до такої коробки
         blacklistTime: 25000,       // скільки ігнорувати коробку після невдачі, мс
 
         roamMinPx: 120,             // випадковий політ, коли коробок немає
@@ -58,7 +60,8 @@
     // гра перевіряє дистанцію до (box.x, box.y - 95), а не до центру коробки
     const COLLECT_Y_OFFSET = 95;
 
-    const sleep = ms => new Promise(r => setTimeout(r, ms));
+    let sleep = ms => new Promise(r => setTimeout(r, ms));
+    let timerWorker = null;
     const rnd = (a, b) => a + Math.random() * (b - a);
     const rndOf = range => rnd(range[0], range[1]);
     const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
@@ -174,6 +177,41 @@
         return null;
     }
 
+    // у прихованій вкладці setTimeout підрізається до ~1с (а згодом і до 1/хв),
+    // тому таймер бота тікає з Web Worker — так само, як це робить сам рушій гри
+    function makeSleep(win) {
+        const pending = [];
+
+        let worker;
+
+        try {
+            const blob = new win.Blob(['setInterval(() => postMessage(0), 10);'], { type: 'application/javascript' });
+
+            worker = new win.Worker(win.URL.createObjectURL(blob));
+            worker.onmessage = flush;
+        } catch (e) {
+            return { sleep: ms => new Promise(r => setTimeout(r, ms)), worker: null };
+        }
+
+        function flush() {
+            const now = Date.now();
+
+            for (let i = pending.length - 1; i >= 0; i--) {
+                if (pending[i].at <= now) {
+                    pending.splice(i, 1)[0].done();
+                }
+            }
+        }
+
+        return {
+            worker: worker,
+            sleep: ms => new Promise(resolve => {
+                pending.push({ at: Date.now() + ms, done: resolve });
+                setTimeout(flush, ms);   // страховка, якщо воркер помре
+            })
+        };
+    }
+
     const frame = findGameFrame();
 
     if (!frame) {
@@ -183,6 +221,10 @@
     const win = frame.win;
     const doc = frame.doc;
     const canvas = doc.querySelector('#game-container canvas');
+    const timer = makeSleep(win);
+
+    sleep = timer.sleep;
+    timerWorker = timer.worker;
     const sceneManager = await findSceneManager(win, doc);
 
     if (!sceneManager || !sceneManager.app) {
@@ -453,6 +495,14 @@
         }
     }
 
+    // скільки треба простояти на коробці після прильоту, не клікаючи нікуди:
+    // будь-який pointerdown викликає в грі cancelCollectionBeamForUser і збір зривається
+    function collectHold(type) {
+        const t = String(type || '');
+
+        return CONFIG.slowTypes.some(p => t.includes(p)) ? CONFIG.slowHoldMs : 0;
+    }
+
     function typeAllowed(type) {
         const t = String(type || '');
 
@@ -588,21 +638,18 @@
     }
 
     async function waitCollected(map, target) {
-        const deadline = Date.now() + CONFIG.collectTimeout;
+        const holdMs = collectHold(target.type);
+        const deadline = Date.now() + CONFIG.collectTimeout + holdMs;
 
         let lastPos = '';
         let movedAt = Date.now();
-        let graceUntil = 0;
+        let arrivedAt = 0;
 
         while (Date.now() < deadline) {
             await sleep(180);
 
             if (!running) {
                 return false;
-            }
-            // сервер прибрав коробку — забрали
-            if (!map.boxes.has(target.hash)) {
-                return true;
             }
 
             const hero = map.hero;
@@ -611,9 +658,38 @@
                 return false;
             }
 
-            // підлетіли впритул: корабель зупиняється і йде промінь збору — це не «застряг»
-            if (Math.hypot(target.x - hero.x, (target.y - COLLECT_Y_OFFSET) - hero.y) <= 60) {
-                graceUntil = Date.now() + 5000;
+            const gone = !map.boxes.has(target.hash);
+            const near = Math.hypot(target.x - hero.x, (target.y - COLLECT_Y_OFFSET) - hero.y) <= 30;
+
+            if (near && !arrivedAt) {
+                arrivedAt = Date.now();
+
+                if (holdMs) {
+                    log('стою на ' + target.type + ' ' + Math.round(holdMs / 1000) + 'с');
+                }
+            }
+
+            if (arrivedAt) {
+                const held = Date.now() - arrivedAt;
+
+                // повільні скрині: вистоюємо весь час збору, навіть якщо спрайт уже зник
+                if (held < holdMs) {
+                    continue;
+                }
+                if (gone) {
+                    return true;
+                }
+                // стоїмо на місці, а сервер коробку так і не прибрав
+                if (held > holdMs + 4000) {
+                    return false;
+                }
+
+                continue;
+            }
+
+            // забрав хтось інший, поки ми летіли
+            if (gone) {
+                return true;
             }
 
             const pos = Math.round(hero.x) + ':' + Math.round(hero.y);
@@ -621,7 +697,7 @@
             if (pos !== lastPos) {
                 lastPos = pos;
                 movedAt = Date.now();
-            } else if (Date.now() > graceUntil && Date.now() - movedAt > 2600 && !map.targetBoxToCollect) {
+            } else if (Date.now() - movedAt > 2600 && !map.targetBoxToCollect) {
                 return false;
             }
         }
@@ -832,6 +908,10 @@
 
     if (window.goBot && typeof window.goBot.stop === 'function') {
         window.goBot.stop();
+
+        if (typeof window.goBot._dispose === 'function') {
+            window.goBot._dispose();
+        }
     }
 
     const api = {
@@ -857,6 +937,8 @@
 
             return {
                 працює: running,
+                вкладка: doc.visibilityState === 'hidden' ? 'прихована' : 'активна',
+                таймер: timerWorker ? 'web worker (без throttling)' : 'setTimeout (буде гальмувати у фоні)',
                 коробок_видно: map ? map.boxes.size : 0,
                 позиція: hero ? grid(hero.x, hero.y) : null,
                 hp: hero ? Math.floor(hero.hp) + '/' + hero.maxHp : null,
@@ -868,7 +950,13 @@
             return printBoxes();
         },
         map: getMap,
-        config: CONFIG
+        config: CONFIG,
+        _dispose() {
+            if (timerWorker) {
+                timerWorker.terminate();
+                timerWorker = null;
+            }
+        }
     };
 
     window.goBot = api;
