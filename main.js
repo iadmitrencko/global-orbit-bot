@@ -35,10 +35,10 @@
     'use strict';
 
     const CONFIG = {
-        include: ['BONUS_BOX'],     // масив підрядків типів, null = всі коробки
-        exclude: [],                // напр. ['ORE'] щоб не брати руду
-                                    // типи: BONUS_BOX, CARGO_BOX, FROM_SHIP, ORE,
-                                    // ALIEN, GIFT_BOXES, PIRATE_BOOTY[_RED|_BLUE|_GOLD]
+        include: ['BONUS_BOX', 'CARGO_BOX'], // масив підрядків типів, null = всі коробки
+        exclude: [],                         // напр. ['ORE'] щоб не брати руду
+                                             // типи: BONUS_BOX, CARGO_BOX, FROM_SHIP, ORE,
+                                             // ALIEN, GIFT_BOXES, PIRATE_BOOTY[_RED|_BLUE|_GOLD]
 
         dryRun: false,              // true = тільки дивитись, нічого не клікати
         scanRadius: 0,              // радіус пошуку в світових одиницях, 0 = без ліміту
