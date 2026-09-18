@@ -30,6 +30,14 @@
  *   сама не тримає, тому бот підлітає, коли ціль далі за npcRange. Щойно видно
  *   потрібну коробку, бот кидається по неї — лазери при цьому б'ють далі, поки
  *   NPC у радіусі, а після збору бот повертається до тієї ж цілі.
+ *
+ *   NPC зі списку npcAvoid (довгі боси) бот не чіпає: побачивши такого ближче
+ *   за npcAvoidDist, відлітає, а коробки й інших NPC біля нього не бере.
+ *
+ *   Коли HP падає нижче retreatHpPct, бот усе кидає, вимикає лазери і тікає
+ *   від NPC (найперше від тих, що б'ють по ньому), а відірвавшись — стоїть,
+ *   поки гра не відремонтує корабель до retreatUntilHpPct. Це працює і без
+ *   атаки NPC: агресивні NPC нападають і під час збору коробок.
  */
 (async function () {
     'use strict';
@@ -53,13 +61,20 @@
         blacklistTime: 25000,       // скільки ігнорувати коробку після невдачі, мс
 
         // бій з NPC (goBot.startKillNpc)
-        npcInclude: null,           // масив підрядків імені NPC, null = всі
+        npcInclude: null,           // масив підрядків імені NPC (регістр неважливий), null = всі
         npcExclude: [],             // напр. ['Boss'] щоб не чіпати
+        npcAvoid: ['Boss Sibelon'], // від таких не просто відмовлятись, а відлітати
+        npcAvoidDist: 1500,         // триматись від них далі ніж стільки одиниць
         npcScanRadius: 0,           // радіус пошуку NPC, 0 = всі, кого показує гра (~2000 од.)
         npcRange: 550,              // далі цього підлітати до цілі (лазер б'є на ~700)
         npcMinHpPct: 30,            // не починати новий бій, коли HP корабля нижче, %
         npcStuckMs: 20000,          // кинути ціль, якщо стільки часу її HP і щит не падають
         npcBlacklistTime: 60000,    // скільки ігнорувати кинуту ціль, мс
+
+        // відступ, коли HP мало (працює і без атаки NPC)
+        retreatHpPct: 20,           // нижче цього кинути все і тікати від NPC, %; 0 = вимкнено
+        retreatUntilHpPct: 75,      // повертатись до роботи, коли HP відновиться до стількох, %
+        retreatSafeDist: 1500,      // тікати, поки NPC ближче за стільки одиниць або по нас б'ють
 
         // політ: курсор тримається натиснутим біля краю екрана, корабель за ним
         steerRadius: 0.40,          // частка меншої сторони екрана — де тримати курсор
@@ -524,7 +539,7 @@
 
     const blacklist = new Map();
     const npcBlacklist = new Map();
-    const stats = { tries: 0, collected: 0, failed: 0, kills: 0, since: Date.now() };
+    const stats = { tries: 0, collected: 0, failed: 0, kills: 0, retreats: 0, since: Date.now() };
 
     function purgeBlacklist() {
         const now = Date.now();
@@ -628,11 +643,13 @@
 
     function pickTarget(map) {
         const now = Date.now();
+        const avoided = avoidedNpcs(map);
         const list = listBoxes(map).filter(b =>
             b.visible
             && typeAllowed(b.type)
             && (!CONFIG.scanRadius || b.dist <= CONFIG.scanRadius)
             && !(blacklist.get(b.hash) > now)
+            && !nearAvoided(avoided, b.x, b.y)
         );
 
         if (!list.length) {
@@ -647,12 +664,33 @@
 
     // ------------------------------------------------- пошук NPC
 
+    function nameMatches(list, name) {
+        const lower = name.toLowerCase();
+
+        return !!list && list.some(p => lower.includes(String(p).toLowerCase()));
+    }
+
+    function isAvoided(name) {
+        return nameMatches(CONFIG.npcAvoid, name);
+    }
+
     function nameAllowed(name) {
-        if (CONFIG.npcExclude.some(p => name.includes(p))) {
+        if (isAvoided(name) || nameMatches(CONFIG.npcExclude, name)) {
             return false;
         }
 
-        return !CONFIG.npcInclude || CONFIG.npcInclude.some(p => name.includes(p));
+        return !CONFIG.npcInclude || nameMatches(CONFIG.npcInclude, name);
+    }
+
+    function avoidedNpcs(map) {
+        return CONFIG.npcAvoid && CONFIG.npcAvoid.length
+            ? listNpcs(map).filter(n => n.visible && isAvoided(n.name))
+            : [];
+    }
+
+    // коробки й NPC біля того, від кого тікаємо, не беремо — інакше бот смикатиметься туди-сюди
+    function nearAvoided(avoided, x, y) {
+        return avoided.some(n => Math.hypot(n.ship.x - x, n.ship.y - y) < CONFIG.npcAvoidDist);
     }
 
     // die() обнуляє hp ще до того, як корабель прибирають із map.ships
@@ -701,12 +739,14 @@
     function pickNpc(map) {
         const now = Date.now();
         const hero = map.hero;
+        const avoided = avoidedNpcs(map);
         const list = listNpcs(map).filter(n =>
             n.visible
             && nameAllowed(n.name)
             && (!CONFIG.npcScanRadius || n.dist <= CONFIG.npcScanRadius)
             && !(n.ship.untargetableUntil > now)
             && !(npcBlacklist.get(n.id) > now)
+            && !nearAvoided(avoided, n.ship.x, n.ship.y)
         );
 
         if (!list.length) {
@@ -855,7 +895,7 @@
 
             const hero = map.hero;
 
-            if (!hero) {
+            if (!hero || mustLeave(map)) {
                 return false;
             }
 
@@ -939,6 +979,11 @@
             return true;
         }
 
+        // кинули коробку, бо треба відходити — це не невдача
+        if (mustLeave(map)) {
+            return false;
+        }
+
         stats.failed++;
         blacklist.set(target.hash, Date.now() + CONFIG.blacklistTime);
         log('не вийшло забрати ' + target.type + ' @' + target.pos + ', ігнорую ' + Math.round(CONFIG.blacklistTime / 1000) + 'с');
@@ -959,7 +1004,7 @@
             const from = worldToClient(map, map.hero.x, map.hero.y);
 
             return clampToRect(from, boxToClient(map, target.box), rect, CONFIG.edgeMargin);
-        }, () => gone() || isClickable(boxToClient(map, target.box)), CONFIG.approachMaxMs);
+        }, () => gone() || mustLeave(map) || isClickable(boxToClient(map, target.box)), CONFIG.approachMaxMs);
     }
 
     let roamAngle = Math.random() * Math.PI * 2;
@@ -998,7 +1043,7 @@
         }, () => {
             const target = pickTarget(map);
 
-            return !!(target && target.clickable) || (killNpc && !!pickNpc(map));
+            return !!(target && target.clickable) || (killNpc && !!pickNpc(map)) || mustLeave(map);
         }, rndOf(CONFIG.roamMaxMs));
     }
 
@@ -1104,7 +1149,7 @@
         }, () => {
             const hero = map.hero;
 
-            return !killNpc || gone() || !!pickTarget(map) || (!!hero
+            return !killNpc || gone() || mustLeave(map) || !!pickTarget(map) || (!!hero
                 && Math.hypot(ship.x - hero.x, ship.y - hero.y) <= CONFIG.npcRange * 0.6
                 && isClickable(shipToClient(map, ship)));
         }, maxMs);
@@ -1126,7 +1171,7 @@
         while (running && killNpc) {
             const hero = map.hero;
 
-            if (!hero || hero.hp <= 0) {
+            if (!hero || hero.hp <= 0 || mustLeave(map)) {
                 return;
             }
             if (npcDead(ship)) {
@@ -1195,6 +1240,164 @@
         }
     }
 
+    // ------------------------------------------------- відступ
+
+    let retreating = false;
+
+    function hpPct(hero) {
+        return hero && hero.maxHp ? Math.floor(hero.hp / hero.maxHp * 100) : 100;
+    }
+
+    function mustRetreat(map) {
+        const hero = map.hero;
+
+        return CONFIG.retreatHpPct > 0 && !!hero && hero.hp > 0 && hpPct(hero) < CONFIG.retreatHpPct;
+    }
+
+    // гра сама ставить hero.lastHitTime на кожне влучання (onReceiveHit)
+    function heroHit(map, ms) {
+        return !!map.hero && Date.now() - (map.hero.lastHitTime || 0) < ms;
+    }
+
+    function inDanger(map) {
+        return heroHit(map, 3000) || listNpcs(map).some(n => n.visible && n.dist < CONFIG.retreatSafeDist);
+    }
+
+    // геть від загроз: ближчі й ті, що зараз б'ють по нас, штовхають сильніше
+    function fleeAngle(map, threats) {
+        const hero = map.hero;
+        const w = map.mapWidth || 21000;
+        const h = map.mapHeight || 13100;
+        const pad = CONFIG.mapPadding * 3;
+
+        let vx = 0;
+        let vy = 0;
+
+        for (const n of threats) {
+            const d = Math.max(n.dist, 50);
+            const weight = (n.ship.isAttacking && n.ship.attackTarget === hero ? 2 : 1) / d;
+
+            vx += (hero.x - n.ship.x) / d * weight;
+            vy += (hero.y - n.ship.y) / d * weight;
+        }
+
+        const len = Math.hypot(vx, vy);
+
+        // нікого не видно, а по нас б'ють (радіація за краєм карти, невидимка) — до центру карти
+        if (!len) {
+            return Math.atan2(h / 2 - hero.y, w / 2 - hero.x);
+        }
+
+        // від країв карти відштовхуємось, щоб не загнати себе в кут
+        vx = vx / len + clamp((pad - hero.x) / pad, 0, 1) - clamp((hero.x - (w - pad)) / pad, 0, 1);
+        vy = vy / len + clamp((pad - hero.y) / pad, 0, 1) - clamp((hero.y - (h - pad)) / pad, 0, 1);
+
+        return Math.atan2(vy, vx);
+    }
+
+    async function flee(map, threats, done) {
+        return drag(map, () => {
+            if (!map.hero) {
+                return null;
+            }
+
+            roamAngle = lerpAngle(roamAngle, fleeAngle(map, threats()), 0.35);
+
+            return steerPoint(map, roamAngle);
+        }, done, 30000);
+    }
+
+    // Усе кидаємо, вимикаємо лазери, тікаємо, поки поруч NPC або по нас б'ють,
+    // а тоді стоїмо, поки гра не відремонтує корабель
+    async function retreat(map) {
+        const until = Math.max(CONFIG.retreatUntilHpPct, CONFIG.retreatHpPct + 1);
+
+        retreating = true;
+        stats.retreats++;
+        log('HP ' + hpPct(map.hero) + '% — кидаю все й відходжу, повернусь при ' + until + '%');
+
+        try {
+            await ceaseFire(map);
+
+            let lastPct = hpPct(map.hero);
+            let growAt = Date.now();
+            let reportAt = Date.now();
+            let hinted = false;
+
+            while (running) {
+                const hero = map.hero;
+
+                if (!hero || hero.hp <= 0) {
+                    return;
+                }
+
+                const pct = hpPct(hero);
+
+                if (pct >= until) {
+                    log('HP ' + pct + '%, повертаюсь до роботи');
+
+                    return;
+                }
+
+                if (inDanger(map)) {
+                    await flee(map, () => listNpcs(map).filter(n => n.dist <= CONFIG.retreatSafeDist * 1.5), () => !inDanger(map));
+                    growAt = Date.now();   // під час втечі гра й так не ремонтує
+                    continue;
+                }
+
+                if (pct > lastPct) {
+                    growAt = Date.now();
+                }
+
+                lastPct = pct;
+
+                if (!hinted && Date.now() - growAt > 60000) {
+                    hinted = true;
+                    log('HP не росте вже хвилину — схоже, тут корабель не ремонтується.'
+                        + ' Можна знизити goBot.config.retreatUntilHpPct або зупинити бота');
+                }
+
+                if (Date.now() - reportAt > 30000) {
+                    reportAt = Date.now();
+                    log('ремонтуюсь: HP ' + pct + '% із ' + until + '%');
+                }
+
+                await sleep(rnd(700, 1500));
+            }
+        } finally {
+            retreating = false;
+        }
+    }
+
+    // ------------------------------------------------- NPC, від яких тікаємо (npcAvoid)
+
+    // k > 1 — запас на втечу: у публічному коді сервера NPC переслідує гравця,
+    // поки той ближче ~2000 од., тож відлітати треба далі, ніж спрацював тригер
+    function avoidNeeded(map, k) {
+        return avoidedNpcs(map).some(n => n.dist < CONFIG.npcAvoidDist * (k || 1));
+    }
+
+    // час кидати поточну справу: мало HP або поруч той, від кого тікаємо
+    function mustLeave(map) {
+        return mustRetreat(map) || avoidNeeded(map);
+    }
+
+    async function avoid(map) {
+        const nearest = avoidedNpcs(map)[0];
+
+        if (!nearest) {
+            return;
+        }
+
+        log('бачу ' + nearest.name + ' за ' + nearest.dist + ' од. — відлітаю');
+
+        await flee(map, () => avoidedNpcs(map), () => !avoidNeeded(map, 1.4) || mustRetreat(map));
+
+        if (!avoidNeeded(map)) {
+            log('відлетів від ' + nearest.name + ', працюю далі');
+        }
+    }
+
     // ------------------------------------------------- головний цикл
 
     let running = false;
@@ -1228,6 +1431,17 @@
                     continue;
                 }
 
+                if (mustRetreat(map)) {
+                    await retreat(map);
+                    continue;
+                }
+
+                if (avoidNeeded(map)) {
+                    await avoid(map);
+                    await sleep(rndOf(CONFIG.reactPause));
+                    continue;
+                }
+
                 if (CONFIG.stopWhenCargoFull && hero.maxCargo && hero.cargo >= hero.maxCargo) {
                     log('трюм повний (' + Math.floor(hero.cargo) + '/' + hero.maxCargo + '), чекаю');
                     await sleep(5000);
@@ -1248,7 +1462,10 @@
                     await (await roam(map) ? sleep(rndOf(CONFIG.reactPause)) : humanPause());
                 } else if (target.clickable) {
                     await collectBox(map, target);
-                    await humanPause();
+
+                    if (!mustLeave(map)) {
+                        await humanPause();
+                    }
                 } else {
                     if (!await approach(map, target)) {
                         blacklist.set(target.hash, Date.now() + 8000);
@@ -1271,7 +1488,8 @@
         return 'зібрано ' + stats.collected + ' / спроб ' + stats.tries
             + ' / невдач ' + stats.failed
             + ' / ' + (min > 0.1 ? (stats.collected / min).toFixed(1) : '0') + ' за хв'
-            + (killNpc || stats.kills ? ' / NPC знищено ' + stats.kills : '');
+            + (killNpc || stats.kills ? ' / NPC знищено ' + stats.kills : '')
+            + (stats.retreats ? ' / відступів ' + stats.retreats : '');
     }
 
     function printNpcs(map) {
@@ -1293,6 +1511,7 @@
             дистанція: n.dist,
             'на екрані': n.onScreen,
             'можна клікнути': n.clickable,
+            уникаю: isAvoided(n.name),
             'проходить фільтр': nameAllowed(n.name) && !(npcBlacklist.get(n.id) > now),
             ціль: n.ship === map.lockedTarget
         })));
@@ -1362,6 +1581,7 @@
                 hp: hero ? Math.floor(hero.hp) + '/' + hero.maxHp : null,
                 трюм: hero && hero.maxCargo ? Math.floor(hero.cargo || 0) + '/' + hero.maxCargo : null,
                 NPC: killNpc ? 'атакую' : 'не чіпаю',
+                відступ: retreating ? 'так, чекаю HP ' + CONFIG.retreatUntilHpPct + '%' : 'ні',
                 ціль: map && map.lockedTarget ? String(map.lockedTarget.userName || '').trim() : null,
                 статистика: statusLine()
             };
