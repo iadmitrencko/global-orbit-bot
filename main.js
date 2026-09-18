@@ -7,6 +7,9 @@
  *   goBot.stop()    — зупинити
  *   goBot.status()  — статистика
  *   goBot.boxes()   — що бот зараз бачить (таблиця)
+ *   goBot.startKillNpc() — ще й атакувати NPC (коробки все одно в пріоритеті)
+ *   goBot.stopKillNpc()  — перестати атакувати NPC
+ *   goBot.npcs()    — які NPC бот зараз бачить (таблиця)
  *   goBot.config    — налаштування (міняються на льоту)
  *
  * Як воно працює:
@@ -21,6 +24,12 @@
  *   pointermove/pointerdown/pointerup, як від миші. Далі все робить сама гра —
  *   MapManager.onBoxClicked() летить до коробки і в своєму update() шле
  *   sendCollectBoxRequest(), коли корабель підлетів ближче ніж на 20 одиниць.
+ *
+ *   NPC бот атакує так само, як людина: клік по кораблю виділяє ціль
+ *   (MapManager.lockOnTarget), Ctrl вмикає лазери (toggleAttack). Дистанцію гра
+ *   сама не тримає, тому бот підлітає, коли ціль далі за npcRange. Щойно видно
+ *   потрібну коробку, бот кидається по неї — лазери при цьому б'ють далі, поки
+ *   NPC у радіусі, а після збору бот повертається до тієї ж цілі.
  */
 (async function () {
     'use strict';
@@ -43,6 +52,15 @@
         slowHoldMs: 6000,           // скільки стояти на місці після прильоту до такої коробки
         blacklistTime: 25000,       // скільки ігнорувати коробку після невдачі, мс
 
+        // бій з NPC (goBot.startKillNpc)
+        npcInclude: null,           // масив підрядків імені NPC, null = всі
+        npcExclude: [],             // напр. ['Boss'] щоб не чіпати
+        npcScanRadius: 0,           // радіус пошуку NPC, 0 = всі, кого показує гра (~2000 од.)
+        npcRange: 550,              // далі цього підлітати до цілі (лазер б'є на ~700)
+        npcMinHpPct: 30,            // не починати новий бій, коли HP корабля нижче, %
+        npcStuckMs: 20000,          // кинути ціль, якщо стільки часу її HP і щит не падають
+        npcBlacklistTime: 60000,    // скільки ігнорувати кинуту ціль, мс
+
         // політ: курсор тримається натиснутим біля краю екрана, корабель за ним
         steerRadius: 0.40,          // частка меншої сторони екрана — де тримати курсор
         steerTick: [70, 170],       // як часто підправляти курс під час польоту, мс
@@ -58,6 +76,7 @@
         mouseSteps: [8, 18],        // кроків у русі миші до цілі
         mouseStepDelay: [8, 22],
         clickHold: [45, 130],       // скільки тримати кнопку натиснутою
+        keyHold: [60, 140],         // скільки тримати клавішу
         aimJitter: 7,               // розкид кліка навколо центру коробки, px
         pickSecondBestChance: 0.18  // іноді брати не найближчу, а другу
     };
@@ -304,6 +323,11 @@
         return worldToClient(map, box.x, box.y);
     }
 
+    // корабель — обгортка, сам PIXI-вузол у нього в pixiContainer
+    function shipToClient(map, ship) {
+        return boxToClient(map, ship.pixiContainer || ship);
+    }
+
     function inRect(p, rect, margin) {
         return p.x >= rect.left + margin && p.x <= rect.right - margin
             && p.y >= rect.top + margin && p.y <= rect.bottom - margin;
@@ -478,17 +502,38 @@
         return true;
     }
 
+    // клавіатура: гра слухає keydown на document свого фрейму (Ctrl — атака)
+    async function tapKey(key, code) {
+        const active = doc.activeElement;
+
+        // поки фокус у полі вводу (чат), гра клавіші ігнорує — людина спершу клікнула б у гру
+        if (active && active !== doc.body && (/^(input|textarea)$/i.test(active.tagName) || active.isContentEditable)) {
+            active.blur();
+        }
+
+        const KeyCtor = win.KeyboardEvent || window.KeyboardEvent;
+        const target = doc.activeElement || doc.body;
+        const init = { key: key, code: code, bubbles: true, cancelable: true, composed: true, view: win };
+
+        target.dispatchEvent(new KeyCtor('keydown', Object.assign({ ctrlKey: key === 'Control' }, init)));
+        await sleep(rndOf(CONFIG.keyHold));
+        target.dispatchEvent(new KeyCtor('keyup', init));
+    }
+
     // ------------------------------------------------- пошук коробок
 
     const blacklist = new Map();
-    const stats = { tries: 0, collected: 0, failed: 0, since: Date.now() };
+    const npcBlacklist = new Map();
+    const stats = { tries: 0, collected: 0, failed: 0, kills: 0, since: Date.now() };
 
     function purgeBlacklist() {
         const now = Date.now();
 
-        for (const [hash, until] of blacklist) {
-            if (until <= now) {
-                blacklist.delete(hash);
+        for (const list of [blacklist, npcBlacklist]) {
+            for (const [key, until] of list) {
+                if (until <= now) {
+                    list.delete(key);
+                }
             }
         }
     }
@@ -595,6 +640,93 @@
         }
         if (list.length > 1 && Math.random() < CONFIG.pickSecondBestChance) {
             return list[1];
+        }
+
+        return list[0];
+    }
+
+    // ------------------------------------------------- пошук NPC
+
+    function nameAllowed(name) {
+        if (CONFIG.npcExclude.some(p => name.includes(p))) {
+            return false;
+        }
+
+        return !CONFIG.npcInclude || CONFIG.npcInclude.some(p => name.includes(p));
+    }
+
+    // die() обнуляє hp ще до того, як корабель прибирають із map.ships
+    function npcDead(ship) {
+        return ship.hp <= 0;
+    }
+
+    function listNpcs(map) {
+        map = map || getMap();
+
+        const out = [];
+
+        if (!map || !map.hero) {
+            return out;
+        }
+
+        const hero = map.hero;
+        const rect = canvas.getBoundingClientRect();
+
+        for (const ship of map.ships.values()) {
+            if (!ship || ship === hero || !ship.isNpc || ship.isPet || typeof ship.x !== 'number' || npcDead(ship)) {
+                continue;
+            }
+
+            const client = shipToClient(map, ship);
+
+            out.push({
+                id: ship.userId,
+                name: String(ship.userName || ship.shipId || 'NPC').trim(),
+                pos: grid(ship.x, ship.y),
+                dist: Math.round(Math.hypot(ship.x - hero.x, ship.y - hero.y)),
+                visible: ship.visible !== false && !ship.isCloaked,
+                onScreen: inRect(client, rect, 0),
+                clickable: isClickable(client, rect),
+                ship: ship
+            });
+        }
+
+        out.sort((a, b) => a.dist - b.dist);
+
+        return out;
+    }
+
+    let lowHpLoggedAt = 0;
+
+    function pickNpc(map) {
+        const now = Date.now();
+        const hero = map.hero;
+        const list = listNpcs(map).filter(n =>
+            n.visible
+            && nameAllowed(n.name)
+            && (!CONFIG.npcScanRadius || n.dist <= CONFIG.npcScanRadius)
+            && !(n.ship.untargetableUntil > now)
+            && !(npcBlacklist.get(n.id) > now)
+        );
+
+        if (!list.length) {
+            return null;
+        }
+
+        // ціль, яку вже виділили чи б'ємо, не міняємо
+        const current = list.find(n => n.ship === hero.attackTarget || n.ship === map.lockedTarget);
+
+        if (current) {
+            return current;
+        }
+
+        if (hero.maxHp && hero.hp / hero.maxHp * 100 < CONFIG.npcMinHpPct) {
+            if (now - lowHpLoggedAt > 60000) {
+                lowHpLoggedAt = now;
+                log('HP ' + Math.round(hero.hp / hero.maxHp * 100) + '% — нових NPC не чіпаю, поки не підлікуюсь');
+            }
+
+            return null;
         }
 
         return list[0];
@@ -866,7 +998,7 @@
         }, () => {
             const target = pickTarget(map);
 
-            return !!(target && target.clickable);
+            return !!(target && target.clickable) || (killNpc && !!pickNpc(map));
         }, rndOf(CONFIG.roamMaxMs));
     }
 
@@ -874,9 +1006,199 @@
         await sleep(Math.random() < CONFIG.longPauseChance ? rndOf(CONFIG.longPause) : rndOf(CONFIG.pause));
     }
 
+    // ------------------------------------------------- бій з NPC
+
+    function npcHealth(ship) {
+        return (ship.hp || 0) + (ship.shield || 0);
+    }
+
+    function isAttackingNpc(map, ship) {
+        const hero = map.hero;
+
+        return !!(hero && hero.isAttacking && hero.attackTarget === ship);
+    }
+
+    // корабля вже немає на карті: вбили, відлетів за межу видимості або перезаспавнився під тим самим id
+    function npcLost(map, target) {
+        return map.ships.get(target.id) !== target.ship;
+    }
+
+    // Ctrl перемикає атаку, тому тиснемо, тільки коли лазери справді б'ють по NPC
+    async function ceaseFire(map) {
+        const hero = map && map.hero;
+
+        if (hero && hero.isAttacking && hero.attackTarget && hero.attackTarget.isNpc) {
+            await tapKey('Control', 'ControlLeft');
+        }
+    }
+
+    // Як людина: клік по NPC виділяє його, Ctrl вмикає лазери. Перед Ctrl
+    // перевіряємо, що виділився саме він, а не гравець, який опинився під курсором.
+    async function engageNpc(map, target) {
+        const ship = target.ship;
+        const jx = rnd(-CONFIG.aimJitter, CONFIG.aimJitter);
+        const jy = rnd(-CONFIG.aimJitter, CONFIG.aimJitter);
+        const aim = () => {
+            if (npcDead(ship) || npcLost(map, target)) {
+                return null;
+            }
+
+            const c = shipToClient(map, ship);
+
+            return isClickable(c) ? { x: c.x + jx, y: c.y + jy } : null;
+        };
+
+        if (map.lockedTarget !== ship) {
+            if (!await clickTarget(aim)) {
+                return false;
+            }
+
+            await sleep(rndOf(CONFIG.reactPause));
+
+            if (map.lockedTarget !== ship) {
+                return false;
+            }
+        }
+
+        if (isAttackingNpc(map, ship)) {
+            return true;
+        }
+
+        // лазери ще б'ють по іншій цілі — перший Ctrl їх вимкне
+        if (map.hero && map.hero.isAttacking) {
+            await tapKey('Control', 'ControlLeft');
+            await sleep(rndOf(CONFIG.reactPause));
+        }
+
+        if (!running || !killNpc) {
+            return false;
+        }
+
+        await tapKey('Control', 'ControlLeft');
+        await sleep(rnd(200, 400));
+
+        return isAttackingNpc(map, ship);
+    }
+
+    // підлітаємо із затиснутою кнопкою — не в сам корабель, а в точку трохи перед ним
+    async function chaseNpc(map, target, maxMs) {
+        const ship = target.ship;
+        const gone = () => npcDead(ship) || npcLost(map, target);
+
+        return drag(map, () => {
+            const hero = map.hero;
+
+            if (!hero || gone()) {
+                return null;
+            }
+
+            const dist = Math.hypot(ship.x - hero.x, ship.y - hero.y) || 1;
+            const short = Math.min(dist, CONFIG.npcRange * 0.4);
+            const rect = canvas.getBoundingClientRect();
+            const from = worldToClient(map, hero.x, hero.y);
+            const to = worldToClient(map,
+                ship.x - (ship.x - hero.x) / dist * short,
+                ship.y - (ship.y - hero.y) / dist * short);
+
+            return clampToRect(from, to, rect, CONFIG.edgeMargin);
+        }, () => {
+            const hero = map.hero;
+
+            return !killNpc || gone() || !!pickTarget(map) || (!!hero
+                && Math.hypot(ship.x - hero.x, ship.y - hero.y) <= CONFIG.npcRange * 0.6
+                && isClickable(shipToClient(map, ship)));
+        }, maxMs);
+    }
+
+    // Бій з однією ціллю. Виходить, коли її знищено, втрачено чи кинуто, або коли
+    // з'явилась коробка: тоді лазери б'ють далі, а бот іде збирати.
+    async function fightNpc(map, target) {
+        const ship = target.ship;
+
+        let last = npcHealth(ship);
+        let progressAt = Date.now();
+        let misses = 0;
+
+        if (!isAttackingNpc(map, ship)) {
+            log('атакую ' + target.name + ' @' + target.pos + ' (' + target.dist + ' од.)');
+        }
+
+        while (running && killNpc) {
+            const hero = map.hero;
+
+            if (!hero || hero.hp <= 0) {
+                return;
+            }
+            if (npcDead(ship)) {
+                stats.kills++;
+                log('знищено ' + target.name + ', всього ' + stats.kills);
+
+                return;
+            }
+            if (npcLost(map, target)) {
+                log(target.name + ' зник з поля зору');
+
+                return;
+            }
+            if (pickTarget(map)) {
+                return;
+            }
+
+            // поки ціль не виділена, в hp/shield лежить заглушка гри —
+            // тому рахуємо тільки падіння, а не порівнюємо з початком
+            const health = npcHealth(ship);
+
+            if (health < last) {
+                progressAt = Date.now();
+            }
+
+            last = health;
+
+            if (Date.now() - progressAt > CONFIG.npcStuckMs) {
+                npcBlacklist.set(target.id, Date.now() + CONFIG.npcBlacklistTime);
+                log('не пробиваю ' + target.name + ' вже ' + Math.round(CONFIG.npcStuckMs / 1000)
+                    + 'с, ігнорую ' + Math.round(CONFIG.npcBlacklistTime / 1000) + 'с');
+                await ceaseFire(map);
+
+                return;
+            }
+
+            // після EMP ціль кілька секунд не виділяється
+            if (ship.untargetableUntil > Date.now()) {
+                await sleep(300);
+                continue;
+            }
+
+            const dist = Math.hypot(ship.x - hero.x, ship.y - hero.y);
+
+            if (dist > CONFIG.npcRange || (!isAttackingNpc(map, ship) && !isClickable(shipToClient(map, ship)))) {
+                await chaseNpc(map, target, Math.max(1000, progressAt + CONFIG.npcStuckMs - Date.now()));
+                await sleep(rndOf(CONFIG.reactPause));
+                continue;
+            }
+
+            if (!isAttackingNpc(map, ship)) {
+                if (await engageNpc(map, target)) {
+                    misses = 0;
+                } else if (++misses >= 3) {
+                    npcBlacklist.set(target.id, Date.now() + CONFIG.npcBlacklistTime);
+                    log('не вдається атакувати ' + target.name + ', ігнорую ' + Math.round(CONFIG.npcBlacklistTime / 1000) + 'с');
+
+                    return;
+                }
+
+                await sleep(rndOf(CONFIG.reactPause));
+                continue;
+            }
+
+            await sleep(rnd(250, 500));
+        }
+    }
+
     // ------------------------------------------------- головний цикл
 
     let running = false;
+    let killNpc = false;
 
     async function loop() {
         while (running) {
@@ -890,6 +1212,11 @@
 
                 if (CONFIG.dryRun) {
                     printBoxes(map);
+
+                    if (killNpc) {
+                        printNpcs(map);
+                    }
+
                     await sleep(2000);
                     continue;
                 }
@@ -910,8 +1237,12 @@
                 purgeBlacklist();
 
                 const target = pickTarget(map);
+                const npc = target || !killNpc ? null : pickNpc(map);
 
-                if (!target) {
+                if (npc) {
+                    await fightNpc(map, npc);
+                    await sleep(rndOf(CONFIG.reactPause));
+                } else if (!target) {
                     // політ перервався тим, що в полі зору з'явилась коробка —
                     // тоді тільки коротка реакція, інакше пролетимо повз неї
                     await (await roam(map) ? sleep(rndOf(CONFIG.reactPause)) : humanPause());
@@ -939,7 +1270,34 @@
 
         return 'зібрано ' + stats.collected + ' / спроб ' + stats.tries
             + ' / невдач ' + stats.failed
-            + ' / ' + (min > 0.1 ? (stats.collected / min).toFixed(1) : '0') + ' за хв';
+            + ' / ' + (min > 0.1 ? (stats.collected / min).toFixed(1) : '0') + ' за хв'
+            + (killNpc || stats.kills ? ' / NPC знищено ' + stats.kills : '');
+    }
+
+    function printNpcs(map) {
+        map = map || getMap();
+
+        const now = Date.now();
+        const list = listNpcs(map);
+
+        if (!list.length) {
+            log('NPC не видно');
+
+            return list;
+        }
+
+        log('видно NPC:', list.length);
+        console.table(list.map(n => ({
+            назва: n.name,
+            координати: n.pos,
+            дистанція: n.dist,
+            'на екрані': n.onScreen,
+            'можна клікнути': n.clickable,
+            'проходить фільтр': nameAllowed(n.name) && !(npcBlacklist.get(n.id) > now),
+            ціль: n.ship === map.lockedTarget
+        })));
+
+        return list;
     }
 
     function printBoxes(map) {
@@ -1003,11 +1361,33 @@
                 позиція: hero ? grid(hero.x, hero.y) : null,
                 hp: hero ? Math.floor(hero.hp) + '/' + hero.maxHp : null,
                 трюм: hero && hero.maxCargo ? Math.floor(hero.cargo || 0) + '/' + hero.maxCargo : null,
+                NPC: killNpc ? 'атакую' : 'не чіпаю',
+                ціль: map && map.lockedTarget ? String(map.lockedTarget.userName || '').trim() : null,
                 статистика: statusLine()
             };
         },
         boxes() {
             return printBoxes();
+        },
+        startKillNpc() {
+            killNpc = true;
+            log('атакую NPC, коробки в пріоритеті');
+
+            return running ? 'атака NPC увімкнена' : api.start() + ' + атака NPC';
+        },
+        stopKillNpc() {
+            if (!killNpc) {
+                return 'атака NPC і так вимкнена';
+            }
+
+            killNpc = false;
+            ceaseFire(getMap());
+            log('NPC більше не чіпаю');
+
+            return 'атака NPC вимкнена';
+        },
+        npcs() {
+            return printNpcs();
         },
         map: getMap,
         config: CONFIG,
@@ -1025,6 +1405,7 @@
         win.goBot = api;
     } catch (e) { /* інший реалм — не критично */ }
 
-    log('готовий. Видно коробок:', getMap().boxes.size, '— goBot.stop() щоб зупинити, goBot.boxes() щоб подивитись список');
+    log('готовий. Видно коробок:', getMap().boxes.size, '— goBot.stop() щоб зупинити, goBot.boxes() щоб подивитись список,'
+        + ' goBot.startKillNpc() щоб ще й атакувати NPC');
     api.start();
 })();
