@@ -35,6 +35,20 @@
         retreatUntilHpPct: 75,      // повертатись до роботи, коли HP відновиться до стількох, %
         retreatSafeDist: 1500,      // тікати, поки NPC ближче за стільки одиниць або по нас б'ють
 
+        // гейт (goBot.startPassGalaxyGate): 1-ша конфігурація — бій, 2-га — швидкість для втечі
+        gateRounds: 10,             // раундів у гейті; після останнього бот летить у правий портал, додому
+        gateStartDist: 700,         // на старті портал гейта має бути ближче за стільки одиниць
+        gateFleeHpPct: 30,          // тікати на 2-й конфігурації, коли HP нижче цього, %...
+        gateFleeShieldPct: 0,       // ...а щит не більше цього, %
+        gatePanicHpPct: 15,         // а нижче цього тікати, хоч би який щит, %; 0 = вимкнено
+        gateRepairHpPct: 90,        // ремонтуватись на 1-й до стількох HP, перш ніж у бій чи в наступний раунд, %
+        gateRepairShieldPct: 90,    // ...і до стількох щита, %
+        gateFleeDist: 3000,         // коли NPC зникли з очей, відлетіти ще на стільки одиниць: деякі дуже швидкі
+        gateKiteDist: 560,          // тримати ціль на такій відстані, поки б'ємо (лазер ~700)
+        gateCrowdDist: 500,         // інші NPC, ближчі за це, відштовхують курс, щоб не влетіти в зграю
+        gateStuckMs: 15000,         // взяти іншу ціль, якщо стільки часу її HP і щит не падають
+        gateSearchMs: 20000,        // стільки чекати без NPC (відлік, між хвилями), перш ніж шукати їх картою
+
         // політ: курсор тримається натиснутим біля краю екрана, корабель за ним
         steerRadius: 0.40,          // частка меншої сторони екрана — де тримати курсор
         steerTick: [70, 170],       // як часто підправляти курс під час польоту, мс
@@ -498,7 +512,7 @@
 
     const blacklist = new Map();
     const npcBlacklist = new Map();
-    const stats = { tries: 0, collected: 0, failed: 0, kills: 0, retreats: 0, since: Date.now() };
+    const stats = { tries: 0, collected: 0, failed: 0, kills: 0, retreats: 0, rounds: 0, since: Date.now() };
 
     function purgeBlacklist() {
         const now = Date.now();
@@ -1074,7 +1088,7 @@
             await sleep(rndOf(CONFIG.reactPause));
         }
 
-        if (!running || !killNpc) {
+        if (!running || !(killNpc || gate)) {
             return false;
         }
 
@@ -1283,7 +1297,7 @@
             let reportAt = Date.now();
             let hinted = false;
 
-            while (running) {
+            while (running && !gate) {
                 const hero = map.hero;
 
                 if (!hero || hero.hp <= 0) {
@@ -1336,9 +1350,9 @@
         return avoidedNpcs(map).some(n => n.dist < CONFIG.npcAvoidDist * (k || 1));
     }
 
-    // час кидати поточну справу: мало HP або поруч той, від кого тікаємо
+    // час кидати поточну справу: пора в гейт, мало HP або поруч той, від кого тікаємо
     function mustLeave(map) {
-        return mustRetreat(map) || avoidNeeded(map);
+        return !!gate || mustRetreat(map) || avoidNeeded(map);
     }
 
     async function avoid(map) {
@@ -1357,12 +1371,809 @@
         }
     }
 
+    // ------------------------------------------------- гейт (goBot.startPassGalaxyGate)
+
+    // гра й сервер дають міняти конфігурацію раз на 5 с — тиснемо з запасом
+    const CONFIG_SWITCH_MS = 5400;
+
+    let gate = null;   // проходження гейта: раунд, фаза, ціль; null — звичайний режим
+
+    const mmss = ms => Math.floor(ms / 60000) + ':' + pad(Math.floor(ms / 1000) % 60);
+    const configName = n => n === 1 ? '1-шу' : '2-гу';
+
+    function shieldPct(hero) {
+        return hero && hero.maxShield ? Math.floor(Math.max(0, hero.shield || 0) / hero.maxShield * 100) : 0;
+    }
+
+    function visibleNpcs(map) {
+        return listNpcs(map).filter(n => n.visible);
+    }
+
+    function listPortals(map) {
+        const hero = map.hero;
+        const out = [];
+
+        for (const portal of map.portals || []) {
+            if (!portal || portal.destroyed || typeof portal.x !== 'number') {
+                continue;
+            }
+
+            out.push({
+                id: portal.portalId,
+                pos: grid(portal.x, portal.y),
+                dist: hero ? Math.round(Math.hypot(portal.x - hero.x, portal.y - hero.y)) : Infinity,
+                portal: portal
+            });
+        }
+
+        out.sort((a, b) => a.dist - b.dist);
+
+        return out;
+    }
+
+    // портали, яких не було до першого NPC: їх відкриває зачищений раунд
+    function freshPortals(map, g) {
+        return listPortals(map).filter(p => !g.known.has(p.id));
+    }
+
+    // номер конфігурації сервер шле в hero.config, але героя гра створює заново після
+    // кожного стрибка — поки номер не прийшов, віримо тому, що знаємо самі
+    function heroConfig(map, g) {
+        const n = map.hero && map.hero.config;
+
+        if (n && n !== g.config) {
+            g.config = n;
+            g.configSince = Date.now();
+        }
+
+        return g.config;
+    }
+
+    // уже на 1-й і з її щитом: номер і щит приходять окремими пакетами, а щит у 2-ї свій
+    function onFirstConfig(map, g) {
+        return heroConfig(map, g) === 1 && Date.now() - g.configSince > 1000;
+    }
+
+    function configReady(map, g) {
+        return Date.now() - Math.max(map.lastConfigChangeTime || 0, g.configAt) >= CONFIG_SWITCH_MS;
+    }
+
+    // C, якщо треба й уже можна. Відповіді не чекаємо: вона сама прийде в hero.config,
+    // а якщо гра попросить не ту конфігурацію, наступне натискання за 5 с це виправить
+    async function switchConfig(map, g, want) {
+        if (!map.hero || heroConfig(map, g) === want || !configReady(map, g)) {
+            return;
+        }
+
+        // так рахує сама гра: не знаючи номера, вона просить 2-гу
+        const asks = (map.hero.config || 1) === 1 ? 2 : 1;
+
+        log('перемикаю на ' + configName(asks) + ' конфігурацію');
+        g.configAt = Date.now();
+        await tapKey('c', 'KeyC');
+
+        if (map.hero && !map.hero.config) {
+            g.config = asks;
+            g.configSince = Date.now();
+        }
+    }
+
+    // правило гейта: HP нижче gateFleeHpPct при порожньому щиті — або зовсім мало HP
+    function gateLow(hero) {
+        const hp = hpPct(hero);
+
+        return hp < CONFIG.gatePanicHpPct
+            || (hp < CONFIG.gateFleeHpPct && shieldPct(hero) <= CONFIG.gateFleeShieldPct);
+    }
+
+    // по нас б'ють або NPC зовсім поруч
+    function gateDanger(map) {
+        return heroHit(map, 3000) || visibleNpcs(map).some(n => n.dist < CONFIG.retreatSafeDist);
+    }
+
+    function gateRepaired(hero, part) {
+        return hpPct(hero) >= CONFIG.gateRepairHpPct * (part || 1)
+            && (!hero.maxShield || shieldPct(hero) >= CONFIG.gateRepairShieldPct * (part || 1));
+    }
+
+    // дію гейта пора кидати: стоп, корабель знищено або гра створила нового героя (стрибок)
+    function gateBroken(map, g) {
+        return gate !== g || !map.hero || map.hero !== g.hero || map.hero.hp <= 0;
+    }
+
+    // Курс, яким «тягаємо» NPC: ціль доганяє, а ми відходимо навскіс, тримаючи відстань want —
+    // далі за неї летимо до цілі, ближче — геть від неї, а на самій want — за 45° від «геть».
+    // Так відстань сама стає там, де наш відхід зрівнюється зі швидкістю цілі. Решта зграї
+    // й край карти відштовхують. Лазери б'ють, а NPC рідше дістають нас усі разом
+    function kiteAngle(map, g, ship, want) {
+        const hero = map.hero;
+        const w = map.mapWidth || 21000;
+        const h = map.mapHeight || 13100;
+        const pad = CONFIG.mapPadding * 2;
+        const ex = clamp((pad - hero.x) / pad, 0, 1) - clamp((hero.x - (w - pad)) / pad, 0, 1);
+        const ey = clamp((pad - hero.y) / pad, 0, 1) - clamp((hero.y - (h - pad)) / pad, 0, 1);
+        const toward = Math.atan2(ship.y - hero.y, ship.x - hero.x);
+        const err = (Math.hypot(ship.x - hero.x, ship.y - hero.y) - want) / 200;
+        const orbit = () => toward + g.orbit * clamp((1 - err) * Math.PI * 3 / 4, 0, Math.PI);
+
+        let angle = orbit();
+
+        // відхід жене в край карти — беремо навскіс в інший бік
+        if (Math.cos(angle) * ex + Math.sin(angle) * ey < -0.3 && Date.now() - g.orbitAt > 3000) {
+            g.orbit = -g.orbit;
+            g.orbitAt = Date.now();
+            angle = orbit();
+        }
+
+        let vx = Math.cos(angle) + ex * 2;
+        let vy = Math.sin(angle) + ey * 2;
+
+        for (const n of listNpcs(map)) {
+            if (n.ship === ship || !n.visible || n.dist >= CONFIG.gateCrowdDist) {
+                continue;
+            }
+
+            const d = Math.max(n.dist, 50);
+            const k = 1.5 * (1 - d / CONFIG.gateCrowdDist);
+
+            vx += (hero.x - n.ship.x) / d * k;
+            vy += (hero.y - n.ship.y) / d * k;
+        }
+
+        return Math.atan2(vy, vx);
+    }
+
+    // і бій, і підліт — перетягуванням, як звичайний політ; курс щотіку з kiteAngle
+    async function gateKite(map, g, target, want, stop, maxMs) {
+        const ship = target.ship;
+        const gone = () => npcDead(ship) || npcLost(map, target);
+
+        return drag(map, () => {
+            if (!map.hero || gone()) {
+                return null;
+            }
+
+            g.heading = lerpAngle(g.heading, kiteAngle(map, g, ship, want), 0.5);
+
+            return steerPoint(map, g.heading);
+        }, () => gateBroken(map, g) || gone() || gateLow(map.hero) || stop(), maxMs);
+    }
+
+    // б'ємо ту, яку вже б'ємо чи виділили, інакше найближчу; свою ціль
+    // кидаємо, лише коли вона відстала, а інший NPC уже поруч
+    function gateTarget(map, g, npcs) {
+        const now = Date.now();
+        const hero = map.hero;
+        const list = npcs.filter(n => !(n.ship.untargetableUntil > now) && !(npcBlacklist.get(n.id) > now));
+        const current = list.find(n => n.ship === hero.attackTarget)
+            || list.find(n => n.ship === map.lockedTarget)
+            || list.find(n => n.ship === g.target);
+
+        if (current && !(current.dist > CONFIG.gateKiteDist + 400 && list[0].dist < CONFIG.gateKiteDist)) {
+            return current;
+        }
+
+        return list[0] || null;
+    }
+
+    // запам'ятовуємо, де кого бачили: хто зник з очей живим, того потім шукаємо там
+    function gateSeeNpcs(g, npcs) {
+        const now = Date.now();
+
+        for (const n of npcs) {
+            g.seen.set(n.id, { x: n.ship.x, y: n.ship.y, at: now, checked: false });
+        }
+    }
+
+    // ціль загинула чи зникла з очей — рахуємо й забуваємо
+    function gateCheckTarget(map, g) {
+        const ship = g.target;
+
+        if (!ship) {
+            return;
+        }
+
+        if (npcDead(ship)) {
+            stats.kills++;
+            g.kills++;
+            g.seen.delete(g.targetId);
+            log('знищено ' + g.targetName + ', у цьому раунді ' + g.kills);
+        } else if (map.ships.get(g.targetId) === ship) {
+            return;
+        } else {
+            log(g.targetName + ' зник з поля зору');
+        }
+
+        g.target = null;
+    }
+
+    async function gateFight(map, g, npcs) {
+        const target = gateTarget(map, g, npcs);
+
+        g.action = 'бій';
+
+        if (!target) {
+            await sleep(300);   // усі, хто поруч, під EMP чи вже кинуті
+
+            return;
+        }
+
+        const ship = target.ship;
+        const health = npcHealth(ship);
+
+        if (g.target !== ship) {
+            g.target = ship;
+            g.targetId = target.id;
+            g.targetName = target.name;
+            g.health = health;
+            g.progressAt = Date.now();
+            g.misses = 0;
+            log('атакую ' + target.name + ' @' + target.pos + ' (' + target.dist + ' од.)');
+        }
+
+        // поки ціль не виділена, в hp/shield лежить заглушка гри — рахуємо тільки падіння
+        if (health < g.health) {
+            g.progressAt = Date.now();
+        }
+
+        g.health = health;
+
+        if (Date.now() - g.progressAt > CONFIG.gateStuckMs) {
+            npcBlacklist.set(target.id, Date.now() + 15000);
+            log('не пробиваю ' + target.name + ' вже ' + Math.round(CONFIG.gateStuckMs / 1000) + 'с, беру іншого');
+            g.target = null;
+            await ceaseFire(map);
+
+            return;
+        }
+
+        if (isAttackingNpc(map, ship)) {
+            await gateKite(map, g, target, CONFIG.gateKiteDist, () => !isAttackingNpc(map, ship), rnd(5000, 9000));
+
+            return;
+        }
+
+        // виділити можна тільки те, що на екрані, тож для цього підлітаємо ближче, ніж кружлятимемо
+        const reach = () => {
+            const hero = map.hero;
+
+            return !!hero && Math.hypot(ship.x - hero.x, ship.y - hero.y) <= CONFIG.gateKiteDist + 100
+                && isClickable(shipToClient(map, ship));
+        };
+
+        if (!reach()) {
+            await gateKite(map, g, target, CONFIG.gateKiteDist - 200, reach, 10000);
+
+            return;
+        }
+
+        if (await engageNpc(map, target)) {
+            g.misses = 0;
+            g.progressAt = Date.now();
+        } else if (++g.misses >= 3) {
+            npcBlacklist.set(target.id, Date.now() + 15000);
+            log('не вдається атакувати ' + target.name + ', беру іншого');
+            g.target = null;
+        }
+    }
+
+    // Правило гейта: мало HP і порожній щит — на 2-гу конфігурацію (швидкість) і геть,
+    // поки NPC не зникнуть з очей, а тоді ще на gateFleeDist: деякі дуже швидкі, а хто
+    // нас загубив, долітає туди, де бачив востаннє. Ремонт потім на 1-й — щит у кожної свій
+    async function gateFlee(map, g) {
+        const started = Date.now();
+        const spot = () => ({ x: map.hero.x, y: map.hero.y });
+        const threats = () => {
+            const list = visibleNpcs(map);
+
+            if (list.length) {
+                g.threat = { x: list[0].ship.x, y: list[0].ship.y };
+                g.lostAt = spot();
+                gateSeeNpcs(g, list);
+
+                return list;
+            }
+
+            // нікого вже не видно — далі від того, кого бачили останнім
+            return g.threat ? [{ dist: Math.hypot(g.threat.x - map.hero.x, g.threat.y - map.hero.y), ship: g.threat }] : [];
+        };
+        const safe = () => !visibleNpcs(map).length && !heroHit(map, 3000)
+            && Math.hypot(g.lostAt.x - map.hero.x, g.lostAt.y - map.hero.y) >= CONFIG.gateFleeDist;
+        const switchDue = () => heroConfig(map, g) !== 2 && configReady(map, g);
+
+        g.action = 'втеча';
+        g.flees++;
+        g.threat = null;
+        g.lostAt = spot();
+        threats();
+        stats.retreats++;
+        log((g.repairing ? 'NPC поруч, а я ще не відремонтувався' : 'HP ' + hpPct(map.hero) + '%, щит ' + shieldPct(map.hero) + '%')
+            + ' — на 2-гу конфігурацію й геть');
+        g.target = null;
+        await ceaseFire(map);
+
+        let warned = false;
+
+        while (!gateBroken(map, g) && !safe()) {
+            await switchConfig(map, g, 2);
+            await flee(map, threats, () => gateBroken(map, g) || safe() || switchDue());
+
+            if (!warned && Date.now() - started > 60000) {
+                warned = true;
+                log('не можу відірватися вже хвилину — тікаю далі');
+            }
+        }
+
+        if (!gateBroken(map, g)) {
+            g.repairing = true;
+            log('відірвався, ремонтуюсь на 1-й конфігурації до HP ' + CONFIG.gateRepairHpPct
+                + '%, щит ' + CONFIG.gateRepairShieldPct + '%');
+        }
+    }
+
+    // Стоїмо, поки гра ремонтує корабель. У публічному коді сервера щит лагодиться тільки
+    // в активної конфігурації й лише через 10 с після бою — тому на 1-й і подалі від NPC.
+    // Виходить, коли відремонтувались, коли ремонту нема або коли NPC поруч
+    async function gateRepair(map, g) {
+        let last = -1;
+        let growAt = Date.now();
+        let reportAt = Date.now();
+
+        g.action = 'ремонт';
+
+        while (!gateBroken(map, g) && !gateDanger(map)) {
+            if (!onFirstConfig(map, g)) {
+                await switchConfig(map, g, 1);
+                await sleep(rnd(400, 700));
+                growAt = Date.now();
+                continue;
+            }
+
+            const hero = map.hero;
+            const hp = hpPct(hero);
+            const shield = shieldPct(hero);
+
+            if (gateRepaired(hero)) {
+                g.repairing = false;
+                log('відремонтувався: HP ' + hp + '%, щит ' + shield + '%');
+
+                return;
+            }
+
+            if (hp + shield > last) {
+                growAt = Date.now();
+            }
+
+            last = hp + shield;
+
+            if (Date.now() - growAt > 30000) {
+                g.repairing = false;
+                log('HP і щит не ростуть уже 30 с — далі як є: HP ' + hp + '%, щит ' + shield + '%');
+
+                return;
+            }
+
+            if (Date.now() - reportAt > 15000) {
+                reportAt = Date.now();
+                log('ремонтуюсь: HP ' + hp + '%, щит ' + shield + '%');
+            }
+
+            await sleep(rnd(600, 1200));
+        }
+    }
+
+    // летимо до точки, поки не побачимо NPC
+    async function gateGoTo(map, g, pos) {
+        return drag(map, () => {
+            const hero = map.hero;
+
+            if (!hero) {
+                return null;
+            }
+
+            roamAngle = lerpAngle(roamAngle, Math.atan2(pos.y - hero.y, pos.x - hero.x), 0.3);
+
+            return steerPoint(map, roamAngle);
+        }, () => gateBroken(map, g) || visibleNpcs(map).length > 0
+            || Math.hypot(pos.x - map.hero.x, pos.y - map.hero.y) < 500, CONFIG.approachMaxMs);
+    }
+
+    // NPC, що загубили ціль, у публічному коді сервера літають між випадковими точками
+    // карти, тож найчастіше — через її середину: там і шукаємо, кружляючи
+    async function gateSearch(map, g) {
+        const cx = (map.mapWidth || 21000) / 2;
+        const cy = (map.mapHeight || 13100) / 2;
+
+        return drag(map, () => {
+            const hero = map.hero;
+
+            if (!hero) {
+                return null;
+            }
+
+            const err = (Math.hypot(cx - hero.x, cy - hero.y) - 2500) / 1000;
+            const angle = Math.atan2(cy - hero.y, cx - hero.x) + g.orbit * clamp((1 - err) * Math.PI / 2, 0, Math.PI * 3 / 4);
+
+            roamAngle = lerpAngle(roamAngle, angle, 0.3);
+
+            return steerPoint(map, roamAngle);
+        }, () => gateBroken(map, g) || visibleNpcs(map).length > 0 || freshPortals(map, g).length > 0,
+        rndOf(CONFIG.roamMaxMs));
+    }
+
+    // Тягнемо корабель курсором прямо на портал: щойно той на екрані, курсор
+    // стоїть на ньому, і корабель зупиняється в самому порталі
+    async function gateFlyTo(map, g, portal, near) {
+        return drag(map, () => {
+            if (!map.hero || portal.destroyed) {
+                return null;
+            }
+
+            return clampToRect(worldToClient(map, map.hero.x, map.hero.y), boxToClient(map, portal),
+                canvas.getBoundingClientRect(), CONFIG.edgeMargin);
+        }, () => gateBroken(map, g) || portal.destroyed
+            || Math.hypot(portal.x - map.hero.x, portal.y - map.hero.y) <= near, CONFIG.approachMaxMs);
+    }
+
+    // стрибок видно з анімації порталу, а прибуття — з нового героя: гра створює його на кожній карті
+    async function gateArrived(map, g, hero, portal) {
+        const started = Date.now();
+
+        let jumping = false;
+
+        while (running && gate === g) {
+            await sleep(250);
+
+            if (map.hero && map.hero !== hero) {
+                return true;
+            }
+
+            jumping = jumping || !!portal.isJumping;
+
+            // анімації нема — сервер стрибок не прийняв
+            if (Date.now() - started > (jumping ? 20000 : 6000)) {
+                return false;
+            }
+        }
+
+        return false;
+    }
+
+    // в сам портал (гра пускає з 500 од., сервер у публічному коді — з 700) і J
+    async function gateJump(map, g, target) {
+        const portal = target.portal;
+
+        for (let attempt = 1; attempt <= 3; attempt++) {
+            if (gate === g && map.hero && map.hero !== g.hero) {
+                return true;   // таки перелетіли, хоч і пізніше, ніж чекали
+            }
+            if (gateBroken(map, g) || portal.destroyed) {
+                return false;
+            }
+
+            if (Math.hypot(portal.x - map.hero.x, portal.y - map.hero.y) > 150) {
+                await gateFlyTo(map, g, portal, 120);
+                await sleep(rnd(600, 1000));   // корабель доїжджає за курсором
+
+                if (gateBroken(map, g) || portal.destroyed) {
+                    continue;
+                }
+            }
+
+            const hero = map.hero;
+
+            log('тисну J біля порталу @' + target.pos);
+            await tapKey('j', 'KeyJ');
+
+            if (await gateArrived(map, g, hero, portal)) {
+                return true;
+            }
+
+            log('стрибок не вийшов, спроба ' + attempt + ' з 3');
+        }
+
+        return false;
+    }
+
+    function startRound(map, g) {
+        Object.assign(g, {
+            phase: 'round',
+            hero: map.hero,
+            roundAt: Date.now(),
+            known: new Set(listPortals(map).map(p => p.id)),
+            npcSeen: false,
+            npcAt: 0,
+            seen: new Map(),
+            threat: null,
+            lostAt: null,
+            target: null,
+            clearedAt: 0,
+            kills: 0,
+            flees: 0,
+            repairing: false,
+            ready: false,
+            action: 'відлік, чекаю NPC'
+        });
+        log('раунд ' + g.round + '/' + CONFIG.gateRounds + ': чекаю на NPC');
+    }
+
+    // Перед стрибком у раунд — ремонт і 1-ша конфігурація: потім не буде коли.
+    // true — можна стрибати
+    async function gateReady(map, g) {
+        if (!onFirstConfig(map, g)) {
+            g.action = 'перемикаю конфігурацію';
+            await switchConfig(map, g, 1);
+            await sleep(300);
+
+            return false;
+        }
+
+        if (!g.ready) {
+            if (!gateRepaired(map.hero) && !gateDanger(map)) {
+                if (!g.repairing) {
+                    g.repairing = true;
+                    log('перед стрибком ремонтуюсь до HP ' + CONFIG.gateRepairHpPct + '%, щит ' + CONFIG.gateRepairShieldPct + '%');
+                }
+
+                await gateRepair(map, g);
+
+                if (g.repairing) {
+                    return false;   // NPC поруч чи стоп — наступний крок розбереться
+                }
+            }
+
+            g.ready = true;
+            g.repairing = false;
+        }
+
+        return true;
+    }
+
+    async function gateEnter(map, g) {
+        const target = listPortals(map).find(p => p.id === g.portalId);
+
+        g.action = 'стрибок у гейт';
+
+        if (!target) {
+            finishGate(g, 'портал гейта зник');
+
+            return;
+        }
+        if (!await gateReady(map, g)) {
+            return;
+        }
+
+        if (await gateJump(map, g, target)) {
+            startRound(map, g);
+        } else {
+            finishGate(g, 'не вдалося стрибнути в портал гейта');
+        }
+    }
+
+    async function gateRound(map, g) {
+        const now = Date.now();
+        const npcs = visibleNpcs(map);
+
+        gateCheckTarget(map, g);
+        purgeBlacklist();
+
+        if (npcs.length) {
+            if (!g.npcSeen) {
+                g.npcSeen = true;
+                log('раунд ' + g.round + ': з\'явились NPC (' + npcs.length + ')');
+            }
+
+            g.npcAt = now;
+            gateSeeNpcs(g, npcs);
+        } else if (!g.npcSeen) {
+            // портали, що є до першого NPC, — не ті, що відкриває зачищений раунд
+            g.known = new Set(listPortals(map).map(p => p.id));
+        }
+
+        // раунд зачищено: NPC нема, а портали з'явились (другий може прийти трохи пізніше)
+        if (g.npcSeen && !npcs.length && freshPortals(map, g).length) {
+            g.clearedAt = g.clearedAt || now;
+
+            if (now - g.clearedAt < 1500) {
+                await sleep(300);
+
+                return;
+            }
+
+            g.phase = 'cleared';
+            g.cleared++;
+            stats.rounds++;
+            log('раунд ' + g.round + '/' + CONFIG.gateRounds + ' пройдено за ' + mmss(now - g.roundAt)
+                + ': знищено ' + g.kills + (g.flees ? ', відступів ' + g.flees : ''));
+
+            return;
+        }
+
+        g.clearedAt = 0;
+
+        // NPC самі прилетіли, поки ремонтуємось: з половиною HP і щита б'ємось, інакше знову геть
+        if (g.repairing && gateDanger(map) && !gateLow(map.hero)
+            && onFirstConfig(map, g) && gateRepaired(map.hero, 0.5)) {
+            g.repairing = false;
+            log('NPC прилетіли самі, а в мене вже HP ' + hpPct(map.hero) + '%, щит ' + shieldPct(map.hero) + '% — б\'юсь');
+        }
+        if ((gateLow(map.hero) || g.repairing) && gateDanger(map)) {
+            await gateFlee(map, g);
+
+            return;
+        }
+        if (g.repairing) {
+            await gateRepair(map, g);
+
+            return;
+        }
+
+        await switchConfig(map, g, 1);   // б'ємось на 1-й
+
+        if (npcs.length) {
+            await gateFight(map, g, npcs);
+
+            return;
+        }
+
+        // Нікого не видно. Хто зник з очей живим, того шукаємо, де бачили востаннє, а далі
+        // посередині карти; якщо всіх побачених знищено — чекаємо наступну хвилю
+        let spot = null;
+
+        for (const s of g.seen.values()) {
+            if (!s.checked && (!spot || s.at > spot.at)) {
+                spot = s;
+            }
+        }
+
+        if (spot && Math.hypot(spot.x - map.hero.x, spot.y - map.hero.y) > 600) {
+            g.action = 'лечу до NPC';
+            await gateGoTo(map, g, spot);
+
+            return;
+        }
+
+        // долетіли — тут нікого, і поблизу теж
+        for (const s of g.seen.values()) {
+            s.checked = s.checked || Math.hypot(s.x - map.hero.x, s.y - map.hero.y) < 2000;
+        }
+
+        const idle = now - (g.npcSeen ? g.npcAt : g.roundAt);
+
+        if (!g.seen.size && idle < CONFIG.gateSearchMs) {
+            g.action = g.npcSeen ? 'чекаю наступну хвилю' : 'відлік, чекаю NPC';
+            await sleep(500);
+
+            return;
+        }
+        if (!g.npcSeen && idle > 180000) {
+            finishGate(g, 'за 3 хв жодного NPC — схоже, це не гейт');
+
+            return;
+        }
+
+        g.action = 'шукаю NPC';
+        await gateSearch(map, g);
+    }
+
+    // лівий портал веде в наступний раунд, правий — додому
+    async function gateCleared(map, g) {
+        const last = g.round >= CONFIG.gateRounds;
+        const fresh = freshPortals(map, g);
+
+        if (visibleNpcs(map).length) {
+            log('NPC ще є — раунд не закінчено');
+            g.phase = 'round';
+            g.clearedAt = 0;
+
+            return;
+        }
+        if (!fresh.length) {
+            g.action = 'чекаю на портали';
+            await sleep(500);
+
+            return;
+        }
+        if (!last && !await gateReady(map, g)) {
+            return;
+        }
+
+        const target = fresh.reduce((a, b) => (last ? b.portal.x > a.portal.x : b.portal.x < a.portal.x) ? b : a);
+
+        g.action = last ? 'лечу додому' : 'лечу в раунд ' + (g.round + 1);
+        log((last ? 'гейт зачищено — лечу в правий портал, додому' : 'лечу в лівий портал, у раунд ' + (g.round + 1))
+            + ' @' + target.pos);
+
+        if (!await gateJump(map, g, target)) {
+            finishGate(g, 'не вдалося стрибнути в портал');
+
+            return;
+        }
+        if (last) {
+            finishGate(g, 'гейт пройдено');
+
+            return;
+        }
+
+        g.round++;
+        startRound(map, g);
+    }
+
+    async function gateStep(map) {
+        const g = gate;
+        const hero = map.hero;
+
+        if (hero.hp !== undefined && hero.hp <= 0) {
+            finishGate(g, 'корабель знищено в раунді ' + g.round);
+
+            return;
+        }
+
+        // гра створила героя заново, а ми не стрибали: стрибок руками чи телепорт
+        if (hero !== g.hero) {
+            log('карта змінилась — вважаю, що це раунд ' + g.round);
+            startRound(map, g);
+
+            return;
+        }
+
+        if (g.phase === 'enter') {
+            await gateEnter(map, g);
+        } else if (g.phase === 'cleared') {
+            await gateCleared(map, g);
+        } else {
+            await gateRound(map, g);
+        }
+    }
+
+    function newGate(map, round, portal) {
+        const g = {
+            round: round,
+            cleared: 0,
+            config: map.hero.config || 1,   // у гейт заходимо на 1-й конфігурації
+            configAt: 0,
+            configSince: 0,
+            orbit: Math.random() < 0.5 ? 1 : -1,
+            orbitAt: 0,
+            heading: Math.random() * Math.PI * 2,
+            startedAt: Date.now()
+        };
+
+        if (portal) {
+            Object.assign(g, {
+                phase: 'enter',
+                portalId: portal.id,
+                hero: map.hero,
+                repairing: false,
+                ready: false,
+                action: 'стрибок у гейт'
+            });
+        } else {
+            startRound(map, g);
+        }
+
+        return g;
+    }
+
+    function finishGate(g, message) {
+        if (gate !== g) {
+            return;
+        }
+
+        gate = null;
+        running = false;
+        log(message + '. Раундів пройдено: ' + g.cleared + ', час ' + mmss(Date.now() - g.startedAt));
+    }
+
     // ------------------------------------------------- головний цикл
 
     let running = false;
+    let looping = false;   // цикл ще живий: після stop() він дограє поточну дію
     let killNpc = false;
 
     async function loop() {
+        looping = true;
+
         while (running) {
             try {
                 const map = getMap();
@@ -1380,6 +2191,11 @@
                     }
 
                     await sleep(2000);
+                    continue;
+                }
+
+                if (gate) {
+                    await gateStep(map);
                     continue;
                 }
 
@@ -1438,7 +2254,19 @@
             }
         }
 
+        looping = false;
         log('зупинено. ' + statusLine());
+    }
+
+    // Якщо після stop() старий цикл ще не дограв поточну дію (паузу, політ), він і
+    // працюватиме далі: новий цикл поруч водив би мишу навперебій зі старим
+    function launch() {
+        running = true;
+        stats.since = Date.now();
+
+        if (!looping) {
+            loop();
+        }
     }
 
     function statusLine() {
@@ -1448,7 +2276,8 @@
             + ' / невдач ' + stats.failed
             + ' / ' + (min > 0.1 ? (stats.collected / min).toFixed(1) : '0') + ' за хв'
             + (killNpc || stats.kills ? ' / NPC знищено ' + stats.kills : '')
-            + (stats.retreats ? ' / відступів ' + stats.retreats : '');
+            + (stats.retreats ? ' / відступів ' + stats.retreats : '')
+            + (stats.rounds ? ' / раундів гейта ' + stats.rounds : '');
     }
 
     function printNpcs(map) {
@@ -1516,13 +2345,16 @@
                 return 'вже працює';
             }
 
-            running = true;
-            stats.since = Date.now();
-            loop();
+            launch();
 
             return 'старт';
         },
         stop() {
+            if (gate) {
+                log('проходження гейта перервано, раунд ' + gate.round);
+                gate = null;
+            }
+
             running = false;
 
             return 'стоп';
@@ -1538,7 +2370,10 @@
                 коробок_видно: map ? map.boxes.size : 0,
                 позиція: hero ? grid(hero.x, hero.y) : null,
                 hp: hero ? Math.floor(hero.hp) + '/' + hero.maxHp : null,
+                щит: hero ? Math.floor(hero.shield || 0) + '/' + (hero.maxShield || 0) : null,
+                конфігурація: hero && hero.config || null,
                 трюм: hero && hero.maxCargo ? Math.floor(hero.cargo || 0) + '/' + hero.maxCargo : null,
+                гейт: gate ? 'раунд ' + gate.round + '/' + CONFIG.gateRounds + ', ' + gate.action : 'ні',
                 NPC: killNpc ? 'атакую' : 'не чіпаю',
                 відступ: retreating ? 'так, чекаю HP ' + CONFIG.retreatUntilHpPct + '%' : 'ні',
                 ціль: map && map.lockedTarget ? String(map.lockedTarget.userName || '').trim() : null,
@@ -1568,6 +2403,41 @@
         npcs() {
             return printNpcs();
         },
+        // round — з якого раунду продовжується гейт, якщо не з 1-го
+        startPassGalaxyGate(round) {
+            if (gate) {
+                return 'вже проходжу гейт: раунд ' + gate.round + '/' + CONFIG.gateRounds;
+            }
+
+            const map = getMap();
+
+            if (!map || !map.hero) {
+                return 'карта ще не готова';
+            }
+
+            // у самому раунді порталів нема: вони з'являються, коли всіх NPC вбито
+            const portal = listPortals(map)[0];
+
+            if (portal && portal.dist > CONFIG.gateStartDist) {
+                return 'підлети до порталу гейта ближче ніж на ' + CONFIG.gateStartDist
+                    + ' од. (до найближчого зараз ' + portal.dist + ') і запусти ще раз';
+            }
+
+            const from = clamp(Math.floor(Number(round)) || 1, 1, CONFIG.gateRounds);
+
+            log(portal
+                ? 'гейт: стрибаю в портал @' + portal.pos + ', раунд ' + from + ' з ' + CONFIG.gateRounds
+                : 'гейт: порталів нема — вважаю, що я вже в раунді');
+            gate = newGate(map, from, portal);
+
+            if (running) {
+                return 'проходжу гейт';
+            }
+
+            launch();
+
+            return 'старт: проходжу гейт';
+        },
         map: getMap,
         config: CONFIG,
         _dispose() {
@@ -1584,7 +2454,7 @@
         win.goBot = api;
     } catch (e) { /* інший реалм — не критично */ }
 
-    log('готовий. Видно коробок:', getMap().boxes.size, '— goBot.stop() щоб зупинити, goBot.boxes() щоб подивитись список,'
-        + ' goBot.startKillNpc() щоб ще й атакувати NPC');
-    api.start();
+    // сам нічого не починає: що робити, кажуть командою
+    log('готовий, чекаю команди: goBot.start() — збирати коробки, goBot.startKillNpc() — ще й бити NPC,'
+        + ' goBot.startPassGalaxyGate() біля порталу гейта — пройти гейт, goBot.stop() — зупинити');
 })();
