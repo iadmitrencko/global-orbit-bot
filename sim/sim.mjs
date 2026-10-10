@@ -7,7 +7,8 @@
 // - сервер — як у публічному емуляторі DarkOrbit 10.0: NPC помічають корабель за 2000 од.,
 //   підлітають на 300 і б'ють з 450, а загубивши — літають між випадковими точками карти;
 //   щит у кожної конфігурації свій, щит ремонтується через 10 с після влучання, HP — через
-//   10 с без бою взагалі; стрибок — через 3.25 с, якщо портал ближче 700 од.;
+//   10 с без бою взагалі; стрибок — через 3.25 с, якщо портал ближче 700 од.; за межами
+//   0…20900 × 0…13000 радіація: 20 000 урону щосекунди, гра показує попередження;
 // - гейт — за описом гравця: відлік 10 с, 4 хвилі, тоді два портали: лівий — у наступний
 //   раунд, правий — додому.
 // HP, швидкості й урон вигадані: симулятор перевіряє логіку бота, а не баланс. Коробок нема.
@@ -33,6 +34,8 @@
 //   --nocfg         сервер не шле номер конфігурації після стрибка
 //   --exitportal    у раунді з самого початку стоїть портал додому
 //   --lowhp         на старті 60% HP
+//   --edge          бій біля західного краю карти, NPC зі сходу: тікати «від них» — у радіацію
+//   --radcircle=R   у гейті безпечна лише зона-коло радіусом R довкола центру, далі радіація
 //   --stopat=S      goBot.stop() через S с після старту гейта
 //   --cfg=JSON      поміняти goBot.config, напр. --cfg='{"gateKiteDist":500}'
 //   --minutes=N     межа віртуального часу: 60 хв на раунд; для --farm це тривалість, 6 хв
@@ -45,8 +48,8 @@ import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
-const FLAGS = ['nostop', 'restart', 'far', 'inside', 'farm', 'hard', 'nocfg', 'exitportal', 'lowhp', 'quiet', 'json'];
-const NUMBERS = ['seed', 'rounds', 'from', 'stopat', 'minutes'];
+const FLAGS = ['nostop', 'restart', 'far', 'inside', 'farm', 'hard', 'nocfg', 'exitportal', 'lowhp', 'edge', 'quiet', 'json'];
+const NUMBERS = ['seed', 'rounds', 'from', 'stopat', 'minutes', 'radcircle'];
 const TEXTS = ['cfg', 'bot'];
 const args = {};
 
@@ -205,7 +208,9 @@ const STEP = 50;
 const HOME_MAP = 1;
 const GATE_MAP = 51;
 const CENTER = { x: 10500, y: 6500 };
+const SPAWN = args.edge ? { x: 1500, y: 6500 } : CENTER;   // де корабель з'являється в раунді
 const PORTAL = { x: 4000, y: 4000 };
+const RAD_DAMAGE = 20000;
 const HERO = {
     maxHp: 200000,
     maxShield: { 1: 150000, 2: 110000 },
@@ -222,6 +227,7 @@ const NPC_TYPES = [
 
 const stat = {
     jumps: 0, jumpFails: 0, cfgSwitches: 0, cfgRejected: 0, clientCooldown: 0, doublePress: 0, inputs: 0,
+    radSeconds: 0, radEntries: 0,
     kills: 0, deaths: 0, hits: 0, minHpPct: 100, maxAttackers: 0, attackerTicks: 0, ticks: 0,
     fightTicks: 0, dist: { '<300': 0, '300–450': 0, '450–600': 0, '600–700': 0, '>700': 0 },
     rounds: []
@@ -247,13 +253,24 @@ const S = {
     npcs: [],
     portals: homePortals(),
     round: 0, wave: 0, state: 'home', stateAt: 0, roundAt: 0,
+    inRad: false, radAt: 0,
     nextNpcId: 5000
 };
 
 if (SCENARIO === 'inside') {
     Object.assign(S, { mapId: GATE_MAP, portals: [], round: FROM, state: 'countdown', stateAt: T0, roundAt: T0 });
-    S.hero.x = CENTER.x;
-    S.hero.y = CENTER.y;
+    S.hero.x = SPAWN.x;
+    S.hero.y = SPAWN.y;
+} else if (SCENARIO === 'farm' && args.edge) {
+    S.hero.x = SPAWN.x;
+    S.hero.y = SPAWN.y;
+}
+
+// радіація: як у CheckRadiation емулятора — поза прямокутником карти, а з --radcircle у гейті
+// ще й поза колом (так сервер робить радіаційні POI)
+function radZone(x, y) {
+    return x < 0 || x > 20900 || y < 0 || y > 13000
+        || (!!args.radcircle && S.mapId === GATE_MAP && Math.hypot(x - CENTER.x, y - CENTER.y) > +args.radcircle);
 }
 
 // клієнт: те, що бачить бот
@@ -261,7 +278,7 @@ const cam = { x: S.hero.x, y: S.hero.y };
 const input = { down: false, x: 0, y: 0 };
 const map = {
     boxes: new Map(), ships: new Map(), stations: new Map(), portals: [],
-    hero: null, lockedTarget: null, targetBoxToCollect: null,
+    hero: null, lockedTarget: null, targetBoxToCollect: null, isPointerDown: false,
     mapWidth: 21000, mapHeight: 13100, currentMapId: S.mapId, lastConfigChangeTime: 0,
     createBox() {},
     displayLayer: {
@@ -294,6 +311,26 @@ globalThis.__sim = {
 const toScreen = (x, y) => map.displayLayer.toGlobal({ x, y });
 const toWorld = (sx, sy) => ({ x: (sx - SCREEN.w / 2) / ZOOM + cam.x, y: (sy - SCREEN.h / 2) / ZOOM + cam.y });
 const inMap = p => ({ x: clamp(p.x, 0, 21000), y: clamp(p.y, 0, 13100) });
+// корабель гра пускає й за край карти — туди, де радіація
+const inWorld = p => ({ x: clamp(p.x, -5000, 26000), y: clamp(p.y, -5000, 18100) });
+
+// попередження гри про радіацію (ScreenNotificationManager.setRadiationZone): поки ми в ній,
+// висить #do-rad-notification; при виході воно гасне (opacity 0) і зникає за 500 мс, а нове
+// створюється окремим елементом — тому їх буває кілька водночас
+let radElements = [];
+
+function setRadiationWarning(on) {
+    const shown = radElements.find(el => el.style.opacity !== '0');
+
+    if (on && !shown) {
+        radElements.push({ id: 'do-rad-notification', style: { opacity: '1' } });
+    } else if (!on && shown) {
+        shown.style.opacity = '0';
+        later(500, () => {
+            radElements = radElements.filter(el => el !== shown);
+        });
+    }
+}
 
 function clientPortal(p) {
     return { portalId: p.id, x: p.x, y: p.y, graphicsId: p.graphicsId, isJumping: false, destroyed: false };
@@ -314,6 +351,8 @@ function initClientMap() {
     map.ships.clear();
     map.lockedTarget = null;
     map.currentMapId = S.mapId;
+    radElements = [];   // як clearZoneWarnings у грі; сервер перевірить радіацію наступним тактом
+    S.inRad = false;
     map.hero = {
         userId: 77, userName: 'hero', isSelf: true, isNpc: false, isPet: false,
         x: S.hero.x, y: S.hero.y, hp: S.hero.hp, maxHp: HERO.maxHp,
@@ -408,8 +447,8 @@ function doJump(dest) {
         S.roundAt = vnow;
         // --exitportal: портал додому стоїть від початку раунду, ще лівіше за «лівий»
         S.portals = args.exitportal ? [{ id: 777, x: 2500, y: CENTER.y, graphicsId: 1, dest: { kind: 'home' } }] : [];
-        S.hero.x = CENTER.x + rnd(-200, 200);
-        S.hero.y = CENTER.y + rnd(-200, 200);
+        S.hero.x = SPAWN.x + rnd(-200, 200);
+        S.hero.y = SPAWN.y + rnd(-200, 200);
         simlog('стрибок: гейт, раунд ' + dest.round);
     } else if (dest.kind === 'home') {
         S.mapId = HOME_MAP;
@@ -429,7 +468,7 @@ function doJump(dest) {
 }
 
 function spawnGroup(count, round) {
-    const angle = rnd(0, Math.PI * 2);
+    const angle = args.edge ? rnd(-Math.PI / 3, Math.PI / 3) : rnd(0, Math.PI * 2);   // --edge: зі сходу
     const dist = rnd(700, 1400);
     const cx = clamp(S.hero.x + Math.cos(angle) * dist, 1000, 20000);
     const cy = clamp(S.hero.y + Math.sin(angle) * dist, 1000, 12100);
@@ -477,9 +516,16 @@ function damageHero(dmg) {
     const toShield = shield >= dmg ? dmg * 0.8 : shield;
 
     h.shield[h.config] = Math.max(0, shield - toShield);
-    h.hp -= dmg - toShield;
-    h.lastHit = vnow;
     stat.hits++;
+    hurt(dmg - toShield);
+}
+
+// по HP: і від NPC, і від радіації
+function hurt(hpLoss) {
+    const h = S.hero;
+
+    h.hp -= hpLoss;
+    h.lastHit = vnow;
     stat.minHpPct = Math.min(stat.minHpPct, Math.max(0, h.hp / HERO.maxHp * 100));
 
     if (map.hero) {
@@ -552,10 +598,25 @@ function tick() {
 
     // кнопка затиснута — корабель летить у точку під курсором, а камера їде за ним
     if (input.down && map.hero && h.alive) {
-        h.target = inMap(toWorld(input.x, input.y));
+        h.target = inWorld(toWorld(input.x, input.y));
     }
     if (h.alive && h.target && !h.jumping && moveToward(h, h.target, HERO.speed[cfg])) {
         h.target = null;
+    }
+
+    // радіація: попередження — як тільки сервер її помітив, урон — щосекунди, щит не рятує
+    const rad = h.alive && !h.jumping && radZone(h.x, h.y);
+
+    if (rad !== S.inRad) {
+        S.inRad = rad;
+        stat.radEntries += rad ? 1 : 0;
+        simlog(rad ? 'корабель у радіації' : 'корабель вийшов з радіації');
+        later(30, () => setRadiationWarning(rad));
+    }
+    if (rad && vnow - S.radAt >= 1000) {
+        S.radAt = vnow;
+        stat.radSeconds++;
+        hurt(RAD_DAMAGE);
     }
 
     let attackers = 0;
@@ -734,12 +795,15 @@ const canvas = {
                 }
             }
 
+            // як MapManager.onPointerDown: прапорець ставить лише клік у порожнечу
             Object.assign(input, { down: true, x: e.clientX, y: e.clientY });
-            S.hero.target = inMap(toWorld(input.x, input.y));
+            map.isPointerDown = true;
+            S.hero.target = inWorld(toWorld(input.x, input.y));
         } else if (e.type === 'pointermove' && input.down) {
             Object.assign(input, { x: e.clientX, y: e.clientY });
         } else if (e.type === 'pointerup') {
             input.down = false;
+            map.isPointerDown = false;
         }
 
         return true;
@@ -781,7 +845,9 @@ class FakeEvent {
 globalThis.window = globalThis;
 globalThis.document = {
     querySelector: sel => sel === '#game-container canvas' ? canvas : null,
-    querySelectorAll: sel => sel.indexOf('script') === 0 ? [{ src: pathToFileURL(path.join(here, 'fakegame.mjs')).href }] : [],
+    querySelectorAll: sel => sel === '#do-rad-notification' ? radElements.slice()
+        : sel.indexOf('script') === 0 ? [{ src: pathToFileURL(path.join(here, 'fakegame.mjs')).href }] : [],
+    getElementById: id => id === 'do-rad-notification' ? radElements[0] || null : null,
     elementFromPoint: () => canvas,
     activeElement: body,
     body: body,
@@ -928,6 +994,10 @@ if (stat.deaths) {
 if (stat.doublePress) {
     problems.push('мишу натиснуто, не відпустивши, ' + stat.doublePress + ' раз(и) — дві дії бота водночас');
 }
+// за край карти бот не має залітати взагалі; невідому зону-коло — хіба що ненадовго
+if (stat.radSeconds > (args.radcircle ? 60 : 0)) {
+    problems.push('у радіації ' + stat.radSeconds + ' с');
+}
 
 if (SCENARIO === 'farm') {
     if (!stat.kills) {
@@ -970,6 +1040,7 @@ const result = {
     deaths: stat.deaths,
     minHp: Math.round(stat.minHpPct * 10) / 10,
     flees: flees,
+    radSeconds: stat.radSeconds,
     errors: errors.length
 };
 const pct = n => Math.round(n / Math.max(1, stat.fightTicks) * 100) + '%';
@@ -991,6 +1062,7 @@ say('знищено NPC ' + stat.kills + ', втеч ' + flees + '; конфіг
 say('ціль під час стрільби: ' + Object.keys(stat.dist).map(k => k + ' ' + pct(stat.dist[k])).join(', '));
 say('по кораблю б\'ють одночасно: у середньому ' + (stat.attackerTicks / Math.max(1, stat.ticks)).toFixed(2)
     + ', найбільше ' + stat.maxAttackers + '; влучань ' + stat.hits);
+say('радіація: ' + stat.radSeconds + ' с, заходів ' + stat.radEntries);
 
 if (Object.keys(actionTime).length) {
     say('час за діями гейта, с: ' + Object.entries(actionTime).sort((a, b) => b[1] - a[1]).map(([k, v]) => k + ' ' + v).join(', '));

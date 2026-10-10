@@ -15,6 +15,10 @@ const SCENARIOS = [
     ['гейт, сід 2', ['--seed=2']],
     ['гейт, сід 3', ['--seed=3']],
     ['гейт, сід 4', ['--seed=4']],
+    ['бій біля краю карти, сід 1', ['--edge', '--seed=1']],
+    ['бій біля краю карти, сід 2', ['--edge', '--seed=2']],
+    ['гейт — зона-коло R 4000', ['--radcircle=4000', '--seed=1']],
+    ['гейт — зона-коло R 5000', ['--radcircle=5000', '--seed=2']],
     ['важкі NPC', ['--hard', '--rounds=5', '--seed=11']],
     ['важкі NPC без номера конфігурації', ['--hard', '--nocfg', '--rounds=5', '--seed=12']],
     ['портал додому вже в раунді', ['--exitportal', '--rounds=3', '--seed=31']],
@@ -24,7 +28,8 @@ const SCENARIOS = [
     ['stop() і одразу старт гейта', ['--restart', '--rounds=3']],
     ['далеко від порталу', ['--far']],
     ['goBot.stop() посеред гейта', ['--stopat=90', '--rounds=3', '--seed=6']],
-    ['звичайний режим, startKillNpc', ['--farm', '--seed=21']]
+    ['звичайний режим, startKillNpc', ['--farm', '--seed=21']],
+    ['звичайний режим біля краю', ['--farm', '--edge', '--seed=21']]
 ];
 const TIMEOUT = 10 * 60000;
 const cores = typeof os.availableParallelism === 'function' ? os.availableParallelism() : os.cpus().length;
@@ -81,6 +86,7 @@ const columns = [
     ['NPC', r => r.result ? String(r.result.kills) : '', 5],
     ['втеч', r => r.result ? String(r.result.flees) : '', 5],
     ['мін. HP', r => r.result ? r.result.minHp + '%' : '', 8],
+    ['радіація', r => r.result ? r.result.radSeconds + ' с' : '', 9],
     ['вірт. час', r => r.result ? r.result.virtualMin + ' хв' : '', 10],
     ['реальний', r => r.result ? r.result.realSec + ' с' : '', 9]
 ];

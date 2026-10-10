@@ -10,7 +10,7 @@
         dryRun: false,              // true = тільки дивитись, нічого не клікати
         scanRadius: 0,              // радіус пошуку в світових одиницях, 0 = без ліміту
         edgeMargin: 70,             // не клікати ближче ніж стільки px до краю екрана
-        mapPadding: 600,            // не підлітати ближче ніж стільки одиниць до краю карти
+        mapPadding: 600,            // не підлітати ближче ніж стільки одиниць до краю карти: за ним радіація
         checkOverlap: true,         // не клікати крізь відкриті вікна інтерфейсу
         stopWhenCargoFull: true,
 
@@ -623,6 +623,7 @@
             && (!CONFIG.scanRadius || b.dist <= CONFIG.scanRadius)
             && !(blacklist.get(b.hash) > now)
             && !nearAvoided(avoided, b.x, b.y)
+            && !unsafeBy(map, b.x, b.y - COLLECT_Y_OFFSET, 200)   // у радіацію навіть по коробку не летимо
         );
 
         if (!list.length) {
@@ -745,6 +746,131 @@
         return list[0];
     }
 
+    // ------------------------------------------------- безпечна зона (радіація)
+
+    // За краєм карти радіація: у публічному коді сервера — все поза 0…20900 × 0…13000, а клієнт
+    // вважає карту 21000 × 13100. Та сервер уміє й зону-коло (радіаційний POI), і її межі клієнт
+    // не знає. Тож курс тримаємо всередині карти з запасом mapPadding, а коли вже ловили
+    // радіацію, вважаємо безпечним лише коло довкола того, де літали без неї, — до найближчого
+    // місця, де її ловили. Для круглої зони це майже вона сама, для будь-якої іншої — обережніше
+    const SAFE_LOOK = 600;      // курс годиться, якщо й за стільки одиниць попереду ще безпечно
+    const RAD_SPOT = 1000;      // місце, де ловили радіацію, обходимо на стільки одиниць
+
+    const radiation = { mapId: null, spots: [], safe: null, warned: false, sumX: 0, sumY: 0, count: 0, at: 0 };
+
+    // середина того, де літали без радіації, і відстань від неї до найближчого місця, де ловили
+    function radiationCircle() {
+        if (!radiation.spots.length || !radiation.count) {
+            return null;
+        }
+
+        const x = radiation.sumX / radiation.count;
+        const y = radiation.sumY / radiation.count;
+
+        return { x, y, r: Math.min(...radiation.spots.map(s => Math.hypot(s.x - x, s.y - y))) };
+    }
+
+    // гра сама показує попередження, поки корабель у радіації (BeaconCommand.inRadiationZone);
+    // згасле ще пів секунди висить у DOM, а нове з'являється окремим елементом
+    function inRadiation() {
+        for (const el of doc.querySelectorAll('#do-rad-notification')) {
+            if (el.style.opacity !== '0') {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    // запам'ятовуємо, де були без радіації і де в неї влетіли; на іншій карті — усе спочатку
+    function watchRadiation(map) {
+        const hero = map.hero;
+
+        if (radiation.mapId !== map.currentMapId) {
+            Object.assign(radiation, { mapId: map.currentMapId, spots: [], safe: null, warned: false, sumX: 0, sumY: 0, count: 0, at: 0 });
+        }
+        if (!hero) {
+            return false;
+        }
+        if (!inRadiation()) {
+            radiation.safe = { x: hero.x, y: hero.y };
+            radiation.warned = false;
+
+            // раз на секунду — у середню точку безпечних місць
+            if (Date.now() - radiation.at >= 1000) {
+                radiation.at = Date.now();
+                radiation.sumX += hero.x;
+                radiation.sumY += hero.y;
+                radiation.count++;
+            }
+
+            return false;
+        }
+        if (!radiation.spots.some(s => Math.hypot(s.x - hero.x, s.y - hero.y) < RAD_SPOT / 2)) {
+            radiation.spots.push({ x: hero.x, y: hero.y });
+            radiation.spots.splice(0, radiation.spots.length - 20);
+        }
+        if (!radiation.warned) {
+            radiation.warned = true;
+            log('радіація @' + grid(hero.x, hero.y) + '! повертаюсь туди, де її не було');
+        }
+
+        return true;
+    }
+
+    // наскільки точка поза безпечною зоною, од.; 0 — всередині
+    function unsafeBy(map, x, y, pad) {
+        const w = map.mapWidth || 21000;
+        const h = map.mapHeight || 13100;
+        const margin = pad === undefined ? CONFIG.mapPadding : pad;
+
+        let out = Math.max(0, margin - x, x - (w - margin)) + Math.max(0, margin - y, y - (h - margin));
+
+        for (const s of radiation.spots) {
+            out += Math.max(0, RAD_SPOT - Math.hypot(x - s.x, y - s.y));
+        }
+
+        const circle = radiationCircle();
+
+        if (circle) {
+            out += Math.max(0, Math.hypot(x - circle.x, y - circle.y) - (circle.r - margin));
+        }
+
+        return out;
+    }
+
+    // Найближчий до бажаного курс, що не виводить із безпечної зони; уже в радіації — назад,
+    // туди, де її не було. Через це проходить кожен політ із затиснутою кнопкою
+    function safeAngle(map, angle) {
+        const hero = map.hero;
+
+        if (watchRadiation(map)) {
+            const back = radiation.safe || { x: (map.mapWidth || 21000) / 2, y: (map.mapHeight || 13100) / 2 };
+
+            return Math.atan2(back.y - hero.y, back.x - hero.x);
+        }
+
+        let best = angle;
+        let bestOut = Infinity;
+
+        for (let i = 0; i <= 12; i++) {
+            for (const side of i ? [1, -1] : [1]) {
+                const a = angle + side * i * Math.PI / 12;
+                const out = unsafeBy(map, hero.x + Math.cos(a) * SAFE_LOOK, hero.y + Math.sin(a) * SAFE_LOOK);
+
+                if (!out) {
+                    return a;
+                }
+                if (out < bestOut) {
+                    best = a;
+                    bestOut = out;
+                }
+            }
+        }
+
+        return best;
+    }
+
     // ------------------------------------------------- дії
 
     // Політ із затиснутою кнопкою — так літають гравці.
@@ -758,12 +884,9 @@
         if (!point || (done && done())) {
             return !!point;
         }
-
-        point = freeSpot(map, point);
-
-        await moveMouse(point.x, point.y);
-        fire('pointerdown', point.x, point.y, 1);
-        fire('mousedown', point.x, point.y, 1);
+        if (!await pressFree(map, point)) {
+            return false;
+        }
 
         const started = Date.now();
 
@@ -775,6 +898,11 @@
 
                 if (done && done()) {
                     reached = true;
+                    break;
+                }
+
+                // гра сама відпустила кнопку (скажімо, вкладку сховали) — політ скінчився
+                if (map.isPointerDown === false) {
                     break;
                 }
 
@@ -794,6 +922,40 @@
         }
 
         return reached;
+    }
+
+    // Натиск, з якого починається політ. Поки миша їде до вільного місця, туди може підлетіти
+    // NPC, тож перед самим натиском дивимось ще раз, а після — чи гра справді почала політ
+    // (MapManager.isPointerDown ставить тільки клік у порожнечу). Не почала — відпускаємо й
+    // пробуємо деінде: інакше бот «тягнув» би мишу, а корабель стояв би посеред бою
+    async function pressFree(map, point) {
+        for (let attempt = 0; attempt < 3; attempt++) {
+            point = freeSpot(map, point);
+            await moveMouse(point.x, point.y);
+
+            const spot = freeSpot(map, point);
+
+            if (spot.x !== point.x || spot.y !== point.y) {
+                fire('pointermove', spot.x, spot.y, 0);
+                fire('mousemove', spot.x, spot.y, 0);
+                cursor.x = spot.x;
+                cursor.y = spot.y;
+            }
+
+            fire('pointerdown', spot.x, spot.y, 1);
+            fire('mousedown', spot.x, spot.y, 1);
+
+            // старий клієнт без цього прапорця — віримо на слово
+            if (map.isPointerDown !== false) {
+                return true;
+            }
+
+            fire('pointerup', spot.x, spot.y, 0);
+            fire('mouseup', spot.x, spot.y, 0);
+            await sleep(rndOf(CONFIG.reactPause));
+        }
+
+        return false;
     }
 
     // Перший натиск мусить влучити в порожнечу: клік по кораблю гра обробить як
@@ -825,7 +987,7 @@
         return point;
     }
 
-    // точка, за яку «тягнемо» корабель: на краю екрана в заданому напрямку
+    // точка, за яку «тягнемо» корабель: на краю екрана в заданому напрямку, але не з безпечної зони
     function steerPoint(map, angle) {
         if (!map.hero) {
             return null;
@@ -834,7 +996,8 @@
         const rect = canvas.getBoundingClientRect();
         const from = worldToClient(map, map.hero.x, map.hero.y);
         const far = Math.min(rect.width, rect.height) * CONFIG.steerRadius;
-        const raw = { x: from.x + Math.cos(angle) * far, y: from.y + Math.sin(angle) * far };
+        const safe = safeAngle(map, angle);
+        const raw = { x: from.x + Math.cos(safe) * far, y: from.y + Math.sin(safe) * far };
 
         return clampToRect(from, raw, rect, CONFIG.edgeMargin) || {
             x: clamp(raw.x, rect.left + CONFIG.edgeMargin, rect.right - CONFIG.edgeMargin),
@@ -1236,36 +1399,43 @@
         return heroHit(map, 3000) || listNpcs(map).some(n => n.visible && n.dist < CONFIG.retreatSafeDist);
     }
 
-    // геть від загроз: ближчі й ті, що зараз б'ють по нас, штовхають сильніше
+    // Геть від загроз: пробуємо 24 курси й беремо той, що за FLEE_LOOK од. виведе найдалі від
+    // найближчої загрози (від тих, що б'ють по нас, — ще далі), не покидаючи безпечної зони.
+    // Біля краю карти так виходить ковзати вздовж нього, а з кута — вибиратися вбік
+    const FLEE_LOOK = 1500;
+
     function fleeAngle(map, threats) {
         const hero = map.hero;
-        const w = map.mapWidth || 21000;
-        const h = map.mapHeight || 13100;
-        const pad = CONFIG.mapPadding * 3;
+        const cx = (map.mapWidth || 21000) / 2;
+        const cy = (map.mapHeight || 13100) / 2;
 
-        let vx = 0;
-        let vy = 0;
+        let best = roamAngle;
+        let bestScore = -Infinity;
 
-        for (const n of threats) {
-            const d = Math.max(n.dist, 50);
-            const weight = (n.ship.isAttacking && n.ship.attackTarget === hero ? 2 : 1) / d;
+        for (let i = 0; i < 24; i++) {
+            const a = i * Math.PI / 12;
+            const x = hero.x + Math.cos(a) * FLEE_LOOK;
+            const y = hero.y + Math.sin(a) * FLEE_LOOK;
 
-            vx += (hero.x - n.ship.x) / d * weight;
-            vy += (hero.y - n.ship.y) / d * weight;
+            // нікого не видно, а по нас б'ють (невидимка) — до середини карти
+            let score = threats.length ? Infinity : -Math.hypot(cx - x, cy - y);
+
+            for (const n of threats) {
+                const k = n.ship.isAttacking && n.ship.attackTarget === hero ? 1.5 : 1;
+
+                score = Math.min(score, Math.hypot(n.ship.x - x, n.ship.y - y) / k);
+            }
+
+            // без різких кидків, а за край — нізащо
+            score += Math.cos(a - roamAngle) * 150 - unsafeBy(map, x, y) * 4;
+
+            if (score > bestScore) {
+                best = a;
+                bestScore = score;
+            }
         }
 
-        const len = Math.hypot(vx, vy);
-
-        // нікого не видно, а по нас б'ють (радіація за краєм карти, невидимка) — до центру карти
-        if (!len) {
-            return Math.atan2(h / 2 - hero.y, w / 2 - hero.x);
-        }
-
-        // від країв карти відштовхуємось, щоб не загнати себе в кут
-        vx = vx / len + clamp((pad - hero.x) / pad, 0, 1) - clamp((hero.x - (w - pad)) / pad, 0, 1);
-        vy = vy / len + clamp((pad - hero.y) / pad, 0, 1) - clamp((hero.y - (h - pad)) / pad, 0, 1);
-
-        return Math.atan2(vy, vx);
+        return best;
     }
 
     async function flee(map, threats, done) {
@@ -1369,6 +1539,12 @@
         if (!avoidNeeded(map)) {
             log('відлетів від ' + nearest.name + ', працюю далі');
         }
+    }
+
+    // Залетіли в радіацію — кидаємо все й назад: курс туди, де її не було, дає safeAngle
+    async function leaveRadiation(map) {
+        await drag(map, () => steerPoint(map, roamAngle),
+            () => !inRadiation() || !map.hero || map.hero.hp <= 0, 20000);
     }
 
     // ------------------------------------------------- гейт (goBot.startPassGalaxyGate)
@@ -1677,13 +1853,26 @@
             // нікого вже не видно — далі від того, кого бачили останнім
             return g.threat ? [{ dist: Math.hypot(g.threat.x - map.hero.x, g.threat.y - map.hero.y), ship: g.threat }] : [];
         };
-        const safe = () => !visibleNpcs(map).length && !heroHit(map, 3000)
-            && Math.hypot(g.lostAt.x - map.hero.x, g.lostAt.y - map.hero.y) >= CONFIG.gateFleeDist;
+        // далеко від місця, де NPC зникли з очей, — або їх уже так довго не видно, що вони
+        // нас загубили: біля краю карти на gateFleeDist буває й нікуди відлітати
+        const safe = () => {
+            if (visibleNpcs(map).length || heroHit(map, 3000)) {
+                g.calmAt = 0;
+
+                return false;
+            }
+
+            g.calmAt = g.calmAt || Date.now();
+
+            return Math.hypot(g.lostAt.x - map.hero.x, g.lostAt.y - map.hero.y) >= CONFIG.gateFleeDist
+                || Date.now() - g.calmAt > 12000;
+        };
         const switchDue = () => heroConfig(map, g) !== 2 && configReady(map, g);
 
         g.action = 'втеча';
         g.flees++;
         g.threat = null;
+        g.calmAt = 0;
         g.lostAt = spot();
         threats();
         stats.retreats++;
@@ -1692,11 +1881,16 @@
         g.target = null;
         await ceaseFire(map);
 
+        // у тісній зоні NPC не відстають, а стояти й ремонтуватись не дадуть; зате на льоту,
+        // коли 10 с не влучають, ремонтуються HP і щит 2-ї — з ними й повертаємось у бій
+        const healed = () => !heroHit(map, 10000) && hpPct(map.hero) >= CONFIG.gateRepairHpPct
+            && (!map.hero.maxShield || shieldPct(map.hero) >= CONFIG.gateRepairShieldPct);
+
         let warned = false;
 
-        while (!gateBroken(map, g) && !safe()) {
+        while (!gateBroken(map, g) && !safe() && !healed()) {
             await switchConfig(map, g, 2);
-            await flee(map, threats, () => gateBroken(map, g) || safe() || switchDue());
+            await flee(map, threats, () => gateBroken(map, g) || safe() || healed() || switchDue());
 
             if (!warned && Date.now() - started > 60000) {
                 warned = true;
@@ -1704,10 +1898,17 @@
             }
         }
 
-        if (!gateBroken(map, g)) {
+        if (gateBroken(map, g)) {
+            return;
+        }
+
+        if (safe()) {
             g.repairing = true;
-            log('відірвався, ремонтуюсь на 1-й конфігурації до HP ' + CONFIG.gateRepairHpPct
+            log('відірвався: заряджаю щит 2-ї, тоді ремонтуюсь на 1-й до HP ' + CONFIG.gateRepairHpPct
                 + '%, щит ' + CONFIG.gateRepairShieldPct + '%');
+        } else {
+            g.repairing = false;
+            log('NPC не відстають, але HP відновилось на льоту до ' + hpPct(map.hero) + '% — назад у бій');
         }
     }
 
@@ -1719,12 +1920,40 @@
         let growAt = Date.now();
         let reportAt = Date.now();
 
+        // true, поки ремонт іде; стоїть 30 с — тут не ремонтує
+        const growing = value => {
+            if (value > last) {
+                growAt = Date.now();
+            }
+
+            last = value;
+
+            return Date.now() - growAt <= 30000;
+        };
+
         g.action = 'ремонт';
 
         while (!gateBroken(map, g) && !gateDanger(map)) {
+            const onSecond = heroConfig(map, g) === 2;
+            const second = map.hero;
+
+            // Щит ремонтується лише в активної конфігурації, тож, поки ще на 2-й, спершу
+            // заряджаємо її щит — інакше наступна втеча буде голою. HP тим часом теж росте
+            if (onSecond && second.maxShield && shieldPct(second) < CONFIG.gateRepairShieldPct
+                && growing(hpPct(second) + shieldPct(second))) {
+                if (Date.now() - reportAt > 15000) {
+                    reportAt = Date.now();
+                    log('заряджаю щит 2-ї конфігурації: ' + shieldPct(second) + '%, HP ' + hpPct(second) + '%');
+                }
+
+                await sleep(rnd(600, 1200));
+                continue;
+            }
+
             if (!onFirstConfig(map, g)) {
                 await switchConfig(map, g, 1);
                 await sleep(rnd(400, 700));
+                last = -1;
                 growAt = Date.now();
                 continue;
             }
@@ -1740,13 +1969,7 @@
                 return;
             }
 
-            if (hp + shield > last) {
-                growAt = Date.now();
-            }
-
-            last = hp + shield;
-
-            if (Date.now() - growAt > 30000) {
+            if (!growing(hp + shield)) {
                 g.repairing = false;
                 log('HP і щит не ростуть уже 30 с — далі як є: HP ' + hp + '%, щит ' + shield + '%');
 
@@ -2191,6 +2414,12 @@
                     }
 
                     await sleep(2000);
+                    continue;
+                }
+
+                // радіація важливіша за все, і в гейті теж (якщо корабель ще цілий)
+                if (!(map.hero.hp <= 0) && watchRadiation(map)) {
+                    await leaveRadiation(map);
                     continue;
                 }
 
